@@ -30,6 +30,28 @@ namespace cg = cooperative_groups;
 #include "forward.h"
 #include "backward.h"
 
+void checkValidCUDAPointer(void *ptr) 
+{
+	cudaPointerAttributes attr;
+	cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+	if (err != cudaSuccess) {
+		printf("Invalid or unrecognized CUDA pointer: %s\n", cudaGetErrorString(err));
+	} else {
+		// attr.type tells you if it's device, host, or managed memory
+		printf("Pointer type: %d\n", attr.type);
+	}
+}
+
+#define CUDA_CHECK(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line)
+{
+    if (code != cudaSuccess) 
+    {
+        fprintf(stderr,"CUDA Error: %s %s %d\n", cudaGetErrorString(code), file, line);
+        exit(code);
+    }
+}
+
 // Helper function to find the next-highest bit of the MSB
 // on the CPU.
 uint32_t getHigherMsb(uint32_t n)
@@ -279,7 +301,7 @@ int CudaRasterizer::Rasterizer::forward(
 
 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
 	int num_rendered;
-	cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost);
+	CUDA_CHECK(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost));
 
 	int binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
@@ -308,7 +330,7 @@ int CudaRasterizer::Rasterizer::forward(
 		binningState.point_list_unsorted, binningState.point_list,
 		num_rendered, 0, 32 + bit);
 
-	cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2));
+	CUDA_CHECK(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)));
 
 	// Identify start and end of per-tile workloads in sorted list
 	if (num_rendered > 0)
