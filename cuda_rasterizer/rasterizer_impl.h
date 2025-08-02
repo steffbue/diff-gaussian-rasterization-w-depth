@@ -58,7 +58,7 @@ namespace CudaRasterizer
 		float* rgb;
 		uint32_t* point_offsets;
 		uint32_t* tiles_touched;
-		float4* prev_cov2D;
+		float4* prev_cov2D_opacity;
 		float3* sqrt_conic;
 		float3* prev_sqrt_cov2D;
 
@@ -84,6 +84,29 @@ namespace CudaRasterizer
 		char* list_sorting_space;
 
 		static BinningState fromChunk(char*& chunk, size_t P);
+	};
+
+	struct GaussianOffsetState
+	{
+		uint32_t* offset;
+
+		static GaussianOffsetState fromChunk(char*& chunk, size_t P);
+	}
+
+	struct GaussianHeaderState
+	{
+		uint2* bbx_min;
+		uint2* bbx_max;
+		uint32_t* t_offset;
+
+		static GaussianHeaderState fromChunk(char*& chunk, size_t P);
+	};
+
+	struct TState
+	{
+		float* t_value;
+
+		static TState fromChunk(char*& chunk, size_t P);
 	};
 
 	template<typename T> 

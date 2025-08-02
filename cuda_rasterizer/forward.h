@@ -120,6 +120,11 @@ namespace FORWARD
 			float* out_color,
 			const float* depth,
 			float* out_depth,
+			const uint32_t* g_offset,
+			const uint2* bbx_min,
+			const uint2* bbx_max,
+			const uint32_t* t_offset,
+			const float* t_value,
 			float* out_flow);
 	}
 

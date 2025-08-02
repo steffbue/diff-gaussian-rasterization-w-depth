@@ -540,6 +540,159 @@ __device__ float2 computePrevPos(const float2& pos, const float2& prev_means2D, 
 	return prev_pos;
 }
 
+// Helper function to fetch transmittance values from cache
+__device__ float fetchTransmittanceValue(
+	const uint32_t P,
+	const uint32_t g_offset,
+	const uint32_t pix_id,
+	const uint2* __restrict__ bbx_min,
+	const uint2* __restrict__ bbx_max,
+	const uint32_t* __restrict__ t_offset,
+	const float* __restrict__ t_value)
+{
+	// If the Gaussian index is out of bounds, return 1.0f (no transmittance)
+	if (g_offset >= P)
+	{
+		return 1.0f;
+	}
+
+	// Fetch bounding box min/max for the Gaussian
+	uint2 min = bbx_min[g_offset];
+	uint2 max = bbx_max[g_offset];
+
+	// Compute offset in transmittance array
+	uint32_t offset = t_offset[g_offset];
+
+	uint2 bbx_size = { max.x - min.x, max.y - min.y };
+
+	// If the bounding box is invalid or pixel id is outside the bounding box, return 1.0f
+	bool invalid_bbx = (bbx_size.x == 0 || bbx_size.y == 0);
+	bool outside_bbx = (pix_id < min.x + min.y * bbx_size.x || pix_id > max.x + max.y * bbx_size.x);
+
+	if (invalid_bbx || outside_bbx)
+	{
+		return 1.0f;
+	}
+	
+	return t_value[offset + (pix_id - (min.x + min.y * bbx_size.x))];
+}
+
+// Main rasterization method. Collaboratively works on one tile per
+// block, each thread treats one pixel. Alternates between fetching 
+// and rasterizing data.
+template <uint32_t CHANNELS>
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+computeTransmittanceCacheLayoutCUDA(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int W, int H,
+	const float2* __restrict__ points_xy_image,
+	const float* __restrict__ features,
+	const float4* __restrict__ conic_opacity,
+	float* __restrict__ final_T,
+	uint32_t* __restrict__ n_contrib,
+	const float* __restrict__ bg_color,
+	uint32_t* __restrict__ out_t_counts_per_gaussian,
+	uint32_t* __restrict__ out_num_t_values)
+{
+	// Identify current tile and associated min/max pixel range.
+	auto block = cg::this_thread_block();
+	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
+	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+	uint32_t pix_id = W * pix.y + pix.x;
+	float2 pixf = { (float)pix.x, (float)pix.y };
+
+	// Check if this thread is associated with a valid pixel or outside.
+	bool inside = pix.x < W&& pix.y < H;
+	// Done threads can help with fetching, but don't rasterize
+	bool done = !inside;
+
+	// Load start/end range of IDs to process in bit sorted list.
+	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+	int toDo = range.y - range.x;
+
+	// Allocate storage for batches of collectively fetched data.
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	__shared__ float collected_depth[BLOCK_SIZE];
+
+	// Initialize helper variables
+	float T = 1.0f;
+	uint32_t contributor = 0;
+	uint32_t last_contributor = 0;
+
+	// Iterate over batches until all done or range is complete
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+	{
+		// End if entire block votes that it is done rasterizing
+		int num_done = __syncthreads_count(done);
+		if (num_done == BLOCK_SIZE)
+			break;
+
+		// Collectively fetch per-Gaussian data from global to shared
+		int progress = i * BLOCK_SIZE + block.thread_rank();
+		if (range.x + progress < range.y)
+		{
+			int coll_id = point_list[range.x + progress];
+			collected_id[block.thread_rank()] = coll_id;
+			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			collected_depth[block.thread_rank()] = depth[coll_id];
+		}
+		block.sync();
+
+		// Iterate over current batch
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		{
+			// Keep track of current position in range
+			contributor++;
+
+			// Resample using conic matrix (cf. "Surface 
+			// Splatting" by Zwicker et al., 2001)
+			float2 xy = collected_xy[j];
+			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			float4 con_o = collected_conic_opacity[j];
+			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			if (power > 0.0f)
+				continue;
+
+			// Eq. (2) from 3D Gaussian splatting paper.
+			// Obtain alpha by multiplying with Gaussian opacity
+			// and its exponential falloff from mean.
+			// Avoid numerical instabilities (see paper appendix). 
+			float alpha = min(0.99f, con_o.w * exp(power));
+			if (alpha < 1.0f / 255.0f)
+				continue;
+			float test_T = T * (1 - alpha);
+			if (test_T < 0.0001f)
+			{
+				done = true;
+				continue;
+			}
+
+
+			T = test_T;
+
+			// Keep track of last range entry to update this
+			// pixel.
+			last_contributor = contributor;
+
+			// Increment number of T values
+			atomicAdd(&out_num_t_values, 1);
+			
+			// Increment T value count per gaussian
+			atomicAdd(&out_t_counts_per_gaussian[collected_id[j]], 1);
+
+		}
+	}
+}
+
+
+
 
 
 // Main rasterization method. Collaboratively works on one tile per
@@ -564,6 +717,11 @@ flowRenderCUDA(
 	float* __restrict__ out_color,
 	const float* __restrict__ depth,
 	float* __restrict__ out_depth,
+	const uint32_t* __restrict__ g_offset,
+	const uint2* __restrict__ bbx_min,
+	const uint2* __restrict__ bbx_max,
+	const uint32_t* __restrict__ t_offset,
+	const float* __restrict__ t_value,
 	float* __restrict__ out_flow)
 {
 	// Identify current tile and associated min/max pixel range.
@@ -681,7 +839,7 @@ flowRenderCUDA(
 
 			// Compute the flow vector by transforming the previous pixel position
 			// to the current pixel position using Gaussian Whitening and De-whitening.
-			prev_pixf = computeFlowVector(
+			prev_pixf = computePrevPos(
 				pixf,
 				collected_prev_xy[j],
 				collected_xy[j],
@@ -707,13 +865,22 @@ flowRenderCUDA(
 				continue;
 			}
 
-			// Compute weights (T, power and alpha) for the flow vector
-			float weights = T * prev_alpha * prev_power;
+			// Fetch transmittance value for the Gaussian at t-1
+			float T_prev = fetchTransmittanceValue(
+				g_offset[collected_id[j]],
+				pix_id,
+				bbx_min,
+				bbx_max,
+				t_offset,
+				t_value);
+
+			// Compute weights (T, power and alpha) for t-1 and t
+			float weights = T_prev * prev_alpha * prev_power * T * alpha * power;
 
 			// Compute the flow vector by subtracting the previous pixel position
 			// from the current pixel position.
-			flow_vector.x += weights * (prev_pixf.x - pixf.x)
-			flow_vector.y += weights * (prev_pixf.y - pixf.y)
+			flow_vector.x += weights * (prev_pixf.x - pixf.x);
+			flow_vector.y += weights * (prev_pixf.y - pixf.y);
 
 			// Add weights to the flow weights
 			flow_weights += weights;
@@ -751,6 +918,46 @@ flowRenderCUDA(
 	}
 }
 
+FORWARD::FLOW::computeTransmittanceCacheLayout(
+	const dim3 grid, dim3 block,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int W, int H,
+	const float2* means2D,
+	const float2* prev_means2D,
+	const float* colors,
+	const float4* conic_opacity,
+	const float4* prev_cov2D_opacity,
+	const float3* sqrt_conic,
+	const float3* prev_sqrt_cov2D,
+	float* final_T,
+	uint32_t* n_contrib,
+	const float* bg_color,
+	uint32_t* out_t_counts_per_gaussian,
+	uint32_t* out_num_t_values,
+	uint32_t* out_gassian_visible_count,
+	uint32_t* out_num_visible_gaussians) 
+{
+	computeTransmittanceCacheLayoutCUDA<NUM_CHANNELS> << <grid, block >> > (
+		ranges,
+		point_list,
+		W, H,
+		means2D,
+		prev_means2D,
+		colors,
+		conic_opacity,
+		prev_cov2D_opacity,
+		sqrt_conic,
+		prev_sqrt_cov2D,
+		final_T,
+		n_contrib,
+		bg_color,
+		out_t_counts_per_gaussian,
+		out_num_t_values,
+		out_gassian_visible_count,
+		out_num_visible_gaussians);
+}
+
 void FORWARD::FLOW::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
@@ -769,6 +976,11 @@ void FORWARD::FLOW::render(
 	float* out_color,
 	const float* depth,
 	float* out_depth,
+	const uint32_t* g_offset,
+	const uint2* bbx_min,
+	const uint2* bbx_max,
+	const uint32_t* t_offset,
+	const float* t_value,
 	float* out_flow)
 {
 	flowRenderCUDA<NUM_CHANNELS> << <grid, block >> > (
@@ -788,6 +1000,11 @@ void FORWARD::FLOW::render(
 		out_color,
 		depth,
 		out_depth,
+		g_offset,
+		bbx_min,
+		bbx_max,
+		t_offset,
+		t_value,
 		out_flow);
 }
 
@@ -894,10 +1111,6 @@ __global__ void preprocessFlowCUDA(int P, int D, int M,
 	float det_inv = 1.f / det;
 	float3 conic = { cov.z * det_inv, -cov.y * det_inv, cov.x * det_inv };
 
-	// Compute square root of 2D covariance matrices
-	float3 sqrt_conic = computeSquareRootCov2D(conic);
-	float3 prev_sqrt_cov2D = computeSquareRootCov2D(prev_cov);
-
 	// Compute extent in screen space (by finding eigenvalues of
 	// 2D covariance matrix). Use extent to compute a bounding rectangle
 	// of screen-space tiles that this Gaussian overlaps with. Quit if
@@ -930,13 +1143,13 @@ __global__ void preprocessFlowCUDA(int P, int D, int M,
 	// Inverse 2D covariance and opacity neatly pack into one float4
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
 	prev_cov2D_opacity[idx] = { prev_cov.x, prev_cov.y, prev_cov.z, prev_opacities[idx] };
-	sqrt_conic[idx] = sqrt_conic;
-	prev_sqrt_cov2D[idx] = prev_sqrt_cov2D;
+	sqrt_conic[idx] = computeSquareRootCov2D(conic);
+	prev_sqrt_cov2D[idx] = computeSquareRootCov2D(prev_cov);
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 	
 }
 
-void FLOW::FORWARD::preprocess(int P, int D, int M,
+void FORWARD::FLOW::preprocess(int P, int D, int M,
 	const float* means3D,
 	const float* prev_means3D,
 	const glm::vec3* scales,

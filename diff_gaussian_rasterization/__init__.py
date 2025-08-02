@@ -278,7 +278,7 @@ class _RasterizeFlowGaussians(torch.autograd.Function):
             raster_settings.sh_degree,
             raster_settings.campos,
             raster_settings.prefiltered,
-            raster_settings.device_id,
+            raster_settings.device_id
         )
 
         # Invoke C++/CUDA rasterizer
@@ -289,6 +289,9 @@ class _RasterizeFlowGaussians(torch.autograd.Function):
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
         ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, sh, geomBuffer, binningBuffer, imgBuffer)
+
+        print("RENDERED")
+
         return color, flow, radii, depth
 
     @staticmethod
@@ -356,7 +359,7 @@ class GaussianFlowRasterizer(nn.Module):
             
         return visible
 
-    def forward(self, means3D, prev_means3D, means2D, opacities, prev_opacities, shs = None, colors_precomp = None, scales = None, prev_scales = None, rotations = None, prev_rotations = None, cov3D_precomp = None, prev_cov3D_precomp = None):
+    def forward(self, means3D, means2D, opacities, prev_means3D = None, prev_opacities = None, shs = None, colors_precomp = None, scales = None, prev_scales = None, rotations = None, prev_rotations = None, cov3D_precomp = None, prev_cov3D_precomp = None):
         
         raster_settings = self.raster_settings
 
@@ -366,6 +369,9 @@ class GaussianFlowRasterizer(nn.Module):
         if ((scales is None or rotations is None) and cov3D_precomp is None) or ((scales is not None or rotations is not None) and cov3D_precomp is not None):
             raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
         
+        if prev_means3D is None:
+            prev_means3D = torch.Tensor([])
+
         if shs is None:
             shs = torch.Tensor([])
         if colors_precomp is None:
@@ -373,10 +379,16 @@ class GaussianFlowRasterizer(nn.Module):
 
         if scales is None:
             scales = torch.Tensor([])
+        if prev_scales is None:
+            prev_scales = torch.Tensor([])
         if rotations is None:
             rotations = torch.Tensor([])
+        if prev_rotations is None:
+            prev_rotations = torch.Tensor([])
         if cov3D_precomp is None:
             cov3D_precomp = torch.Tensor([])
+        if prev_cov3D_precomp is None:
+            prev_cov3D_precomp = torch.Tensor([])
 
         # Invoke C++/CUDA rasterization routine
         return rasterize_gaussians_flow(

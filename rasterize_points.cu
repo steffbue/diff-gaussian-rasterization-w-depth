@@ -276,7 +276,7 @@ RasterizeGaussiansFlowCUDA(
   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
   torch::Tensor out_depth = torch::full({1, H, W}, 0.0, float_opts);
-  torch::Tensor out_flow = torch.full({2, H, W}, 0.0, float_opts);
+  torch::Tensor out_flow = torch::full({2, H, W}, 0.0, float_opts);
   
   torch::Device device(torch::kCUDA, device_id);
   torch::TensorOptions options(torch::kByte);
@@ -286,6 +286,14 @@ RasterizeGaussiansFlowCUDA(
   std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
   std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
+
+  // Create cache buffers for transmittance T
+  torch::Tensor gaussianOffsetBuffer = torch::empty({0}, options.device(device));
+  torch::Tensor gaussianHeaderBuffer = torch::empty({0}, options.device(device));
+  torch::Tensor	tBuffer = torch::empty({0}, options.device(device));
+  std::function<char*(size_t)> gaussianOffsetFunc = resizeFunctional(gaussianOffsetBuffer);
+  std::function<char*(size_t)> gaussianHeaderFunc = resizeFunctional(gaussianHeaderBuffer);
+  std::function<char*(size_t)> tFunc = resizeFunctional(tBuffer);
 
   int rendered = 0;
   if(P != 0)
@@ -300,6 +308,9 @@ RasterizeGaussiansFlowCUDA(
 	    geomFunc,
 		binningFunc,
 		imgFunc,
+		gaussianOffsetFunc,
+		gaussianHeaderFunc,
+		tFunc,
 	    P, degree, M,
 		background.contiguous().data<float>(),
 		W, H,
