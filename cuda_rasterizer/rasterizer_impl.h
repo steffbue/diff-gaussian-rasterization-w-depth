@@ -44,25 +44,14 @@ namespace CudaRasterizer
 		static GeometryState fromChunk(char*& chunk, size_t P);
 	};
 
-	struct GeometryStateFlow
+	struct FlowState
 	{
-		size_t scan_size;
-		float* depths;
-		char* scanning_space;
-		bool* clamped;
-		int* internal_radii;
-		float2* means2D;
 		float2* prev_means2D;
-		float* cov3D;
-		float4* conic_opacity;
-		float* rgb;
-		uint32_t* point_offsets;
-		uint32_t* tiles_touched;
 		float4* prev_cov2D_opacity;
 		float3* sqrt_conic;
 		float3* prev_sqrt_cov2D;
 
-		static GeometryStateFlow fromChunk(char*& chunk, size_t P);
+		static FlowState fromChunk(char*& chunk, size_t P);
 	};
 
 	struct ImageState
@@ -97,16 +86,17 @@ namespace CudaRasterizer
 	{
 		uint2* bbx_min;
 		uint2* bbx_max;
-		uint32_t* t_offset;
+		uint32_t* cache_offset;
 
 		static GaussianHeaderState fromChunk(char*& chunk, size_t P);
 	};
 
-	struct TState
+	struct CacheState
 	{
 		float* t_value;
+		float* g_value;
 
-		static TState fromChunk(char*& chunk, size_t P);
+		static CacheState fromChunk(char*& chunk, size_t P);
 	};
 
 	template<typename T> 

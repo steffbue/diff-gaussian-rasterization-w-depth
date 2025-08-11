@@ -163,26 +163,36 @@ __global__ void generateBinaryMask(
 __global__ void fillTransmittanceCache(
 	int P, const uint32_t* __restrict__ gaussians_offsets,
 	const uint32_t* __restrict__ gaussians_visibility_mask,
-	const uint32_t* __restrict__ t_offsets,
-	const uint2* __restrict__ rect_min,
-	const uint2* __restrict__ rect_max,
-	const uint32_t* __restrict__ out_gaussian_offsets,
-	const float2* __restrict__ out_gaussian_bbx_min,
-	const float2* __restrict__ out_gaussian_bbx_max,
-	const uint32_t* __restrict__ out_t_offsets,
-	float* __restrict__ out_t_values)
+	const uint32_t* __restrict__ cache_offsets,
+	const uint2* __restrict__ bbx_min,
+	const uint2* __restrict__ bbx_max,
+	uint32_t* __restrict__ out_gaussian_offsets,
+	uint2* __restrict__ out_bbx_min,
+	uint2* __restrict__ out_bbx_max,
+	uint32_t* __restrict__ out_cache_offsets,
+	float* __restrict__ out_t_values,
+	float* __restrict__ out_g_values)
 {
 	auto idx = cg::this_grid().thread_rank();
-	if (idx >= P || gaussians_visibility_mask[idx] == 0)
+
+	if (idx >= P)
 		return;
 
-	out_gaussian_offsets[idx] = gaussians_offsets[idx]
-	out_gaussian_bbx_min[out_gaussian_offsets[idx]] = rect_min[idx];
-	out_gaussian_bbx_min[out_gaussian_offsets[idx]] = rect_max[idx];
-	out_t_offsets[out_gaussian_offsets[idx]] = t_offsets[idx];
-	out_t_values[idx] = 0.0f;
+	if (gaussians_visibility_mask[idx] == 0) {
+		out_gaussian_offsets[idx] = std::numeric_limits<uint32_t>::max();
+		return;
+	}
 
+	const uint32_t g_index = gaussians_offsets[idx];
+	out_gaussian_offsets[idx] = g_index;
 	
+	out_bbx_min[g_index] = bbx_min[idx];
+	out_bbx_max[g_index] = bbx_max[idx];
+
+	const uint32_t c_index = cache_offsets[idx];
+	out_cache_offsets[g_index] = c_index;
+	out_t_values[c_index] = 0.0f;
+	out_g_values[c_index] = 0.0f;	
 }
 
 // Wrapper method to call auxiliary coarse frustum containment test.
@@ -326,25 +336,14 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	return geom;
 }
 
-CudaRasterizer::GeometryStateFlow CudaRasterizer::GeometryStateFlow::fromChunk(char*& chunk, size_t P)
+CudaRasterizer::FlowState CudaRasterizer::FlowState::fromChunk(char*& chunk, size_t P)
 {
-	GeometryStateFlow geom;
-	obtain(chunk, geom.depths, P, 128);
-	obtain(chunk, geom.clamped, P * 3, 128);
-	obtain(chunk, geom.internal_radii, P, 128);
-	obtain(chunk, geom.means2D, P, 128);
-	obtain(chunk, geom.prev_means2D, P, 128);
-	obtain(chunk, geom.cov3D, P * 6, 128);
-	obtain(chunk, geom.conic_opacity, P, 128);
-	obtain(chunk, geom.rgb, P * 3, 128);
-	obtain(chunk, geom.tiles_touched, P, 128);
-	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
-	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
-	obtain(chunk, geom.point_offsets, P, 128);
-	obtain(chunk, geom.prev_cov2D_opacity, P, 128);
-	obtain(chunk, geom.sqrt_conic, P * 3, 128);
-	obtain(chunk, geom.prev_sqrt_cov2D, P * 3, 128);
-	return geom;
+	FlowState flow;
+	obtain(chunk, flow.prev_means2D, P, 128);
+	obtain(chunk, flow.prev_cov2D_opacity, P, 128);
+	obtain(chunk, flow.sqrt_conic, P * 3, 128);
+	obtain(chunk, flow.prev_sqrt_cov2D, P * 3, 128);
+	return flow;
 }
 
 CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, size_t N)
@@ -516,6 +515,170 @@ int CudaRasterizer::Rasterizer::forward(
 	return num_rendered;
 }
 
+// Create a cache of transmittance and Gaussian function values per pixel.
+int CudaRasterizer::Rasterizer::createCache(
+	std::function<char* (size_t)> geometryBuffer,
+	std::function<char* (size_t)> binningBuffer,
+	std::function<char* (size_t)> imageBuffer,
+	std::function<char* (size_t)> gaussianOffsetBuffer,
+	std::function<char* (size_t)> gaussianHeaderBuffer,
+	std::function<char* (size_t)> cacheBuffer,
+	const int P, int D, int M,
+	const float* background,
+	const int width, int height,
+	const float* means3D,
+	const float* shs,
+	const float* colors_precomp,
+	const float* opacities,
+	const float* scales,
+	const float scale_modifier,
+	const float* rotations,
+	const float* cov3D_precomp,
+	const float* viewmatrix,
+	const float* projmatrix,
+	const float* cam_pos,
+	const float tan_fovx, float tan_fovy,
+	const bool prefiltered,
+	int* radii)
+{
+	const float focal_y = height / (2.0f * tan_fovy);
+	const float focal_x = width / (2.0f * tan_fovx);
+
+	size_t chunk_size = required<GeometryState>(P);
+	char* chunkptr = geometryBuffer(chunk_size);
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+
+	if (radii == nullptr)
+	{
+		radii = geomState.internal_radii;
+	}
+
+	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
+	dim3 block(BLOCK_X, BLOCK_Y, 1);
+
+	// Dynamically resize image-based auxiliary buffers during training
+	int img_chunk_size = required<ImageState>(width * height);
+	char* img_chunkptr = imageBuffer(img_chunk_size);
+	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
+
+	if (NUM_CHANNELS != 3 && colors_precomp == nullptr)
+	{
+		throw std::runtime_error("For non-RGB, provide precomputed Gaussian colors!");
+	}
+
+	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
+	FORWARD::preprocess(
+		P, D, M,
+		means3D,
+		(glm::vec3*)scales,
+		scale_modifier,
+		(glm::vec4*)rotations,
+		opacities,
+		shs,
+		geomState.clamped,
+		cov3D_precomp,
+		colors_precomp,
+		viewmatrix, projmatrix,
+		(glm::vec3*)cam_pos,
+		width, height,
+		focal_x, focal_y,
+		tan_fovx, tan_fovy,
+		radii,
+		geomState.means2D,
+		geomState.depths,
+		geomState.cov3D,
+		geomState.rgb,
+		geomState.conic_opacity,
+		tile_grid,
+		geomState.tiles_touched,
+		prefiltered
+	);
+
+	// Compute prefix sum over full list of touched tile counts by Gaussians
+	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
+	cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size,
+		geomState.tiles_touched, geomState.point_offsets, P);
+
+	// Retrieve total number of Gaussian instances to launch and resize aux buffers
+	int num_rendered;
+	CUDA_CHECK(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost));
+
+	int binning_chunk_size = required<BinningState>(num_rendered);
+	char* binning_chunkptr = binningBuffer(binning_chunk_size);
+	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
+
+	// For each instance to be rendered, produce adequate [ tile | depth ] key 
+	// and corresponding dublicated Gaussian indices to be sorted
+	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
+		P,
+		geomState.means2D,
+		geomState.depths,
+		geomState.point_offsets,
+		binningState.point_list_keys_unsorted,
+		binningState.point_list_unsorted,
+		radii,
+		tile_grid
+		);
+
+	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
+
+	// Sort complete list of (duplicated) Gaussian indices by keys
+	cub::DeviceRadixSort::SortPairs(
+		binningState.list_sorting_space,
+		binningState.sorting_size,
+		binningState.point_list_keys_unsorted, binningState.point_list_keys,
+		binningState.point_list_unsorted, binningState.point_list,
+		num_rendered, 0, 32 + bit);
+
+	CUDA_CHECK(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)));
+
+	// Identify start and end of per-tile workloads in sorted list
+	if (num_rendered > 0)
+		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
+			num_rendered,
+			binningState.point_list_keys,
+			imgState.ranges
+			);
+
+	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+
+	// Create transmittance cache for flow rendering
+	GaussianOffsetState gaussianOffsetState;
+	GaussianHeaderState gaussianHeaderState;
+	CacheState cacheState;
+
+	createCache(
+		P, tile_grid, block,
+		imgState, binningState, geomState,
+		gaussianOffsetBuffer, gaussianHeaderBuffer, cacheBuffer,
+		width, height,
+		feature_ptr,
+		gaussianOffsetState,
+		gaussianHeaderState,
+		cacheState);
+
+	// Let each tile blend its range of Gaussians independently in parallel
+	FORWARD::renderCache(
+		tile_grid, block,
+		imgState.ranges,
+		binningState.point_list,
+		width, height,
+		geomState.means2D,
+		feature_ptr,
+		geomState.conic_opacity,
+		imgState.accum_alpha,
+		imgState.n_contrib,
+		background,
+		gaussianOffsetState.offset,
+		gaussianHeaderState.bbx_min,
+		gaussianHeaderState.bbx_max,
+		gaussianHeaderState.offset,
+		cacheState.t_value,
+		cacheState.g_value);
+
+	return num_rendered;
+}
+
 // Produce necessary gradients for optimization, corresponding
 // to forward render pass
 void CudaRasterizer::Rasterizer::backward(
@@ -613,71 +776,65 @@ void CudaRasterizer::Rasterizer::backward(
 		(glm::vec4*)dL_drot);
 }
 
-void createTransmittanceCache(
+void createCache(
 	int P, dim3 tile_grid, dim3 block,
 	const ImageState& imgState,
 	const BinningState& binningState,
 	const GeometryStateFlow& geomState,
 	std::function<char* (size_t)> gaussianOffsetBuffer,
 	std::function<char* (size_t)> gaussianHeaderBuffer,
-	std::function<char* (size_t)> tBuffer,
+	std::function<char* (size_t)> cacheBuffer,
 	const int width, const int height,
 	const float* feature_ptr,
 	GaussianOffsetState& out_gaussianOffsetState,
 	GaussianHeaderState& out_gaussianHeaderState,
-	TState& out_tState	
+	CacheState& out_cacheState	
 )
 {
-	// Allocate cache for T values
-	uint32_t num_visible_gaussians = 0;
-	uint32_t num_t_values = 0;
-	
-	uint32_t* t_counts_per_gaussian;
-	uint32_t* t_offsets;
-	uint32_t* gaussians_visibility_mask;
-	uint32_t* gaussians_offsets;
+	// Allocate temporary variables for computing the buffer sizes dynamically
+	uint32_t* gaussians_vis_mask; // 1 if Gaussian is visible for any pixel, otherwise 0
+	uint32_t* gaussians_offsets; // Offsets computed from visibility mask
 
-	CUDA_CHECK(cudaMalloc((void**)&t_counts_per_gaussian, P * sizeof(uint32_t)));
-	CUDA_CHECK(cudaMalloc((void**)&gaussians_visibility_mask, P * sizeof(uint32_t)));
+	uint32_t* cache_counts_per_gaussian; // Number of T, G values per Gaussian
+	uint32_t* cache_offsets; // Offsets computed from cache counts
+
+	CUDA_CHECK(cudaMalloc((void**)&gaussians_vis_mask, P * sizeof(uint32_t)));
 	CUDA_CHECK(cudaMalloc((void**)&gaussians_offsets, P * sizeof(uint32_t)));
-	CUDA_CHECK(cudaMalloc((void**)&t_offsets, P * sizeof(uint32_t)));
+	CUDA_CHECK(cudaMalloc((void**)&cache_counts_per_gaussian, P * sizeof(uint32_t)));
+	CUDA_CHECK(cudaMalloc((void**)&cache_offsets, P * sizeof(uint32_t)));
 
 
-	FORWARD::FLOW::computeTransmittanceCacheLayout(
+	uint32_t total_cache_count = 0;
+	FORWARD::FLOW::computeCacheLayout(
 		tile_grid, block,
 		imgState.ranges,
 		binningState.point_list,
 		width, height,
 		geomState.means2D,
-		geomState.prev_means2D,
 		feature_ptr,
 		geomState.conic_opacity,
-		geomState.prev_cov2D_opacity,
-		geomState.sqrt_conic,
-		geomState.prev_sqrt_cov2D,
 		imgState.accum_alpha,
 		imgState.n_contrib,
-		gaussianOffsetState.offset,
-		t_counts_per_gaussian,
-		num_t_values
-	);
+		cache_counts_per_gaussian,
+		total_cache_count
+	)
 
-	computeVisibilityMask<< <(P + 255) / 256, 256 >> > (
+	
+	computeVisibilityMask << <(P + 255) / 256, 256 >> > (
 		P,
-		t_counts_per_gaussian,
-		gaussians_visibility_mask
+		cache_counts_per_gaussian,
+		gaussians_vis_mask
 	);
 
 	// Count total number of visible Gaussians
-	computeSumCUDA(P, gaussians_visibility_mask, &num_visible_gaussians);
+	uint32_t num_visible_gaussians = 0;
+	computeSumCUDA(P, gaussians_vis_mask, &num_visible_gaussians);
 
-	// Compute prefix sum over both arrays
-	computePrefixSumCUDA(t_counts_per_gaussian, t_offsets, P);
-	computePrefixSumCUDA(gaussians_visibility_mask, gaussians_offsets, P);
+	// Compute prefix sum over gaussians
+	computePrefixSumCUDA(gaussians_vis_mask, gaussians_offsets, P);
+	computePrefixSumCUDA(cache_counts_per_gaussian, cache_offsets, P);
 
-	CHECK_CUDA(cudaDeviceSynchronize());
-
-	// Allocate space for T value data structure
+	// Allocate data structure
 	size_t gaussian_offset_chunk_size = required<GaussianOffsetState>(P);
 	char* gaussian_offset_chunkptr = gaussianOffsetBuffer(gaussian_offset_chunk_size);
 	out_gaussianOffsetState = GaussianOffsetState::fromChunk(gaussian_offset_chunkptr, P);
@@ -686,38 +843,38 @@ void createTransmittanceCache(
 	char* gaussian_header_chunkptr = gaussianHeaderBuffer(gaussian_header_chunk_size);
 	out_gaussianHeaderState = GaussianHeaderState::fromChunk(gaussian_header_chunkptr, num_visible_gaussians);
 
-	size_t t_chunk_size = required<TState>(num_t_values);
-	char* t_chunkptr = tBuffer(t_chunk_size);
-	out_tState = TState::fromChunk(t_chunkptr, num_t_values);
+	size_t cache_chunk_size = required<CacheState>(total_cache_count);
+	char* cache_chunkptr = cacheBuffer(cache_chunk_size);
+	out_cacheState = CacheState::fromChunk(cache_chunkptr, total_cache_count);
 
-	fillTransmittanceCache<< <(P + 255) / 256, 256 >> > (
+	fillTransmittanceCache << <(P + 255) / 256, 256 >> > (
 		P, gaussians_offsets,
-		gaussians_visibility_mask, 
-		t_offsets,
+		gaussians_vis_mask,
+		cache_offsets,
 		geomState.rect_min,
 		geomState.rect_max,
 		out_gaussianOffsetState.offset,
 		out_gaussianHeaderState.bbx_min,
 		out_gaussianHeaderState.bbx_max,
-		out_gaussianHeaderState.t_offset,
-		out_tState.t_value
+		out_gaussianHeaderState.cache_offset,
+		out_cacheState.t_value,
+		out_cacheState.g_value
 	);
 
-	CHECK_CUDA(cudaFree(gaussians_visibility_mask));
-	CHECK_CUDA(cudaFree(t_counts_per_gaussian));
-	CHECK_CUDA(cudaFree(gaussians_offsets));
-	CHECK_CUDA(cudaFree(t_offsets));
+	// Free temporary variables
+	CUDA_CHECK(cudaFree(gaussians_vis_mask));
+	CUDA_CHECK(cudaFree(gaussians_offsets));
+	CUDA_CHECK(cudaFree(cache_counts));
+	CUDA_CHECK(cudaFree(cache_offsets));
 }
 
 // Forward rendering procedure for differentiable rasterization
 // of Gaussians.
 int CudaRasterizer::FlowRasterizer::forward(
 	std::function<char* (size_t)> geometryBuffer,
+	std::function<char* (size_t)> flowBuffer,
 	std::function<char* (size_t)> binningBuffer,
 	std::function<char* (size_t)> imageBuffer,
-	std::function<char* (size_t)> gaussianOffsetBuffer,
-	std::function<char* (size_t)> gaussianHeaderBuffer,
-	std::function<char* (size_t)> tBuffer,
 	const int P, int D, int M,
 	const float* background,
 	const int width, int height,
@@ -736,6 +893,12 @@ int CudaRasterizer::FlowRasterizer::forward(
 	const float* prev_cov3D_precomp,
 	const float* viewmatrix,
 	const float* projmatrix,
+	const char* gaussianOffsetBuffer,
+	const uint32_t gaussianOffsetBufferSize,
+	const char* gaussianHeaderBuffer,
+	const uint32_t gaussianHeaderBufferSize,
+	const char* cacheBuffer,
+	const uint32_t cacheBufferSize,
 	const float* cam_pos,
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,
@@ -747,9 +910,13 @@ int CudaRasterizer::FlowRasterizer::forward(
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
-	size_t chunk_size = required<GeometryStateFlow>(P);
+	size_t chunk_size = required<GeometryState>(P);
 	char* chunkptr = geometryBuffer(chunk_size);
-	GeometryStateFlow geomState = GeometryStateFlow::fromChunk(chunkptr, P);
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+
+	size_t flow_chunk_size = required<FlowState>(P);
+	char* flow_chunkptr = flowBuffer(flow_chunk_size);
+	FlowState flowState = FlowState::fromChunk(flow_chunkptr, P);
 
 	if (radii == nullptr)
 	{
@@ -793,16 +960,16 @@ int CudaRasterizer::FlowRasterizer::forward(
 		tan_fovx, tan_fovy,
 		radii,
 		geomState.means2D,
-		geomState.prev_means2D,
+		flowBuffer.prev_means2D,
 		geomState.depths,
 		geomState.cov3D,
 		geomState.rgb,
 		geomState.conic_opacity,
 		tile_grid,
 		geomState.tiles_touched,
-		geomState.prev_cov2D_opacity,
-		geomState.sqrt_conic,
-		geomState.prev_sqrt_cov2D,
+		flowBuffer.prev_cov2D_opacity,
+		flowBuffer.sqrt_conic,
+		flowBuffer.prev_sqrt_cov2D,
 		prefiltered
 	);
 
@@ -852,40 +1019,29 @@ int CudaRasterizer::FlowRasterizer::forward(
 			imgState.ranges
 			);
 
-	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
 
-	// Create transmittance cache for flow rendering
-	GaussianOffsetState gaussianOffsetState;
-	GaussianHeaderState gaussianHeaderState;
-	TState tState;
-
-	createTransmittanceCache(
-		P, tile_grid, block,
-		imgState, binningState, geomState,
-		gaussianOffsetBuffer, gaussianHeaderBuffer, tBuffer,
-		width, height,
-		feature_ptr,
-		gaussianOffsetState,
-		gaussianHeaderState,
-		tState);
-
-	size_t chunk_size = required<GeometryStateFlow>(P);
-	char* chunkptr = geometryBuffer(chunk_size);
-	GeometryStateFlow geomState = GeometryStateFlow::fromChunk(chunkptr, P);
+	// Cast the cache buffers to the appropriate types
+	GaussianOffsetState gaussianOffsetState = GaussianOffsetState::fromChunk(
+		gaussianOffsetBuffer, gaussianOffsetBufferSize);
+	GaussianHeaderState gaussianHeaderState = GaussianHeaderState::fromChunk(
+		gaussianHeaderBuffer, gaussianHeaderBufferSize);
+	CacheState cacheState = CacheState::fromChunk(
+		cacheBuffer, cacheBufferSize);
 
 	// Let each tile blend its range of Gaussians independently in parallel
+	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
 	FORWARD::FLOW::render(
 		tile_grid, block,
 		imgState.ranges,
 		binningState.point_list,
-		width, height,
+		P, width, height,
 		geomState.means2D,
-		geomState.prev_means2D,
+		flowState.prev_means2D,
 		feature_ptr,
 		geomState.conic_opacity,
-		geomState.prev_cov2D_opacity,
-		geomState.sqrt_conic,
-		geomState.prev_sqrt_cov2D,
+		flowState.prev_cov2D_opacity,
+		flowState.sqrt_conic,
+		flowState.prev_sqrt_cov2D,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		background,
@@ -895,8 +1051,9 @@ int CudaRasterizer::FlowRasterizer::forward(
 		gaussianOffsetState.offset,
 		gaussianHeaderState.bbx_min,
 		gaussianHeaderState.bbx_max,
-		gaussianHeaderState.t_offset,
-		tState.t_value,
+		gaussianHeaderState.offset,
+		cacheState.t_value,
+		cacheState.g_value,
 		out_flow);
 
 	return num_rendered;
