@@ -115,14 +115,12 @@ namespace CudaRasterizer
 		const ImageState& imgState,
 		const BinningState& binningState,
 		const GeometryState& geomState,
-		std::function<char* (size_t)> gaussianOffsetBuffer,
 		std::function<char* (size_t)> gaussianHeaderBuffer,
 		std::function<char* (size_t)> cacheBuffer,
 		const int width, const int height,
 		const float* feature_ptr,
 		const float* bg_color,
 		const float* depth,
-		GaussianOffsetState& out_gaussianOffsetState,
 		GaussianHeaderState& out_gaussianHeaderState,
 		CacheState& out_cacheState
 	);

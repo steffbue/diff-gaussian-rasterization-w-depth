@@ -76,7 +76,6 @@ namespace FORWARD
 		uint32_t* n_contrib,
 		const float* bg_color,
 		const float* depth,
-		const uint32_t* gaussian_offset,
 		const uint2* bbx_min,
 		const uint2* bbx_max,
 		const uint32_t* cache_offset,
@@ -140,7 +139,6 @@ namespace FORWARD
 			float* out_color,
 			const float* depth,
 			float* out_depth,
-			const uint32_t* gaussian_offset,
 			const uint2* bbx_min,
 			const uint2* bbx_max,
 			const uint32_t* cache_offset,
@@ -149,19 +147,10 @@ namespace FORWARD
 			float* out_flow);
 
 		void computeCacheLayout(
-			const dim3 grid, dim3 block,
-			const uint2* ranges,
-			const uint32_t* point_list,
-			int W, int H,
-			const float2* means2D,
-			const float* colors,
-			const float4* conic_opacity,
-			float* final_T,
-			uint32_t* n_contrib,
-			const float* bg_color,
-			const float* depth,
-			uint32_t* out_cache_counts_per_gaussian,
-			uint32_t* out_total_cache_count); 
+			int P,
+			const uint2* bbx_min,
+			const uint2* bbx_max,
+			uint32_t* out_cache_counts_per_gaussian); 
 		
 	}
 

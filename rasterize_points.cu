@@ -250,7 +250,6 @@ RasterizeGaussiansFlowCUDA(
 	const torch::Tensor& prev_cov3D_precomp,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
-	const torch::Tensor& gaussianOffsetBuffer,
 	const torch::Tensor& gaussianHeaderBuffer,
 	const torch::Tensor& cacheBuffer,
 	const float tan_fovx, 
@@ -325,8 +324,6 @@ RasterizeGaussiansFlowCUDA(
 		viewmatrix.contiguous().data<float>(), 
 		projmatrix.contiguous().data<float>(),
 		campos.contiguous().data<float>(),
-		gaussianOffsetBuffer.contiguous().data<char>(),
-		gaussianOffsetBuffer.numel(),
 		gaussianHeaderBuffer.contiguous().data<char>(),
 		gaussianHeaderBuffer.numel(),
 		cacheBuffer.contiguous().data<char>(),
@@ -342,7 +339,7 @@ RasterizeGaussiansFlowCUDA(
   return std::make_tuple(rendered, out_color, out_flow, radii, geomBuffer, binningBuffer, imgBuffer, out_depth);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor>
 createCache(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -386,10 +383,8 @@ createCache(
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
 
   // Create cache buffers
-  torch::Tensor gaussianOffsetBuffer = torch::empty({0}, options.device(device));
   torch::Tensor gaussianHeaderBuffer = torch::empty({0}, options.device(device));
   torch::Tensor cacheBuffer = torch::empty({0}, options.device(device));
-  std::function<char*(size_t)> gaussianOffsetFunc = resizeFunctional(gaussianOffsetBuffer);
   std::function<char*(size_t)> gaussianHeaderFunc = resizeFunctional(gaussianHeaderBuffer);
   std::function<char*(size_t)> cacheFunc = resizeFunctional(cacheBuffer);
 
@@ -405,7 +400,6 @@ createCache(
 	    geomFunc,
 		binningFunc,
 		imgFunc,
-		gaussianOffsetFunc,
 		gaussianHeaderFunc,
 		cacheFunc,
 	    P, degree, M,
@@ -428,5 +422,5 @@ createCache(
 		radii.contiguous().data<int>());
   }
   
-  return std::make_tuple(gaussianOffsetBuffer, gaussianHeaderBuffer, cacheBuffer);
+  return std::make_tuple(gaussianHeaderBuffer, cacheBuffer);
 }

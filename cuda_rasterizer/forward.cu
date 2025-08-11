@@ -115,7 +115,7 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 // Helper function to read cache
 __device__ void readCache(
 	const uint32_t P,
-	const uint32_t g_offset,
+	const uint32_t g_index,
 	const uint32_t pix_id,
 	const uint2 bbx_min,
 	const uint2 bbx_max,
@@ -126,7 +126,7 @@ __device__ void readCache(
 	float* out_G)
 {
 	// If the Gaussian index is out of bounds, return 0.0f (no contribution)
-	if (g_offset >= P)
+	if (g_index >= P)
 	{
 		*out_T = 0.0f;
 		*out_G = 0.0f;
@@ -157,7 +157,7 @@ __device__ void readCache(
 // Helper function to write cache
 __device__ void writeCache(
 	const uint32_t P,
-	const uint32_t g_offset,
+	const uint32_t g_index,
 	const uint32_t pix_id,
 	const uint2 bbx_min,
 	const uint2 bbx_max,
@@ -168,7 +168,7 @@ __device__ void writeCache(
 	const float G)
 {
 	// If the Gaussian index is out of bounds, return
-	if (g_offset >= P)
+	if (g_index >= P)
 	{
 		return;
 	}
@@ -489,7 +489,6 @@ renderCacheCUDA(
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	const float* __restrict__ depth,
-	const uint32_t* __restrict__ gaussian_offset,
 	const uint2* __restrict__ bbx_min,
 	const uint2* __restrict__ bbx_max,
 	const uint32_t* __restrict__ cache_offset,
@@ -521,7 +520,6 @@ renderCacheCUDA(
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_depth[BLOCK_SIZE];
 	
-	__shared__ uint32_t collected_gaussian_offset[BLOCK_SIZE];
 	__shared__ uint2 collected_bbx_min[BLOCK_SIZE];
 	__shared__ uint2 collected_bbx_max[BLOCK_SIZE];
 	__shared__ uint32_t collected_cache_offset[BLOCK_SIZE];
@@ -553,11 +551,9 @@ renderCacheCUDA(
 			collected_depth[block.thread_rank()] = depth[coll_id];
 
 
-			uint32_t g_offset = gaussian_offset[coll_id];
-			collected_gaussian_offset[block.thread_rank()] = g_offset;
-			collected_bbx_min[block.thread_rank()] = bbx_min[g_offset];
-			collected_bbx_max[block.thread_rank()] = bbx_max[g_offset];
-			collected_cache_offset[block.thread_rank()] = cache_offset[g_offset];
+			collected_bbx_min[block.thread_rank()] = bbx_min[coll_id];
+			collected_bbx_max[block.thread_rank()] = bbx_max[coll_id];
+			collected_cache_offset[block.thread_rank()] = cache_offset[coll_id];
 		}
 		block.sync();
 
@@ -611,7 +607,7 @@ renderCacheCUDA(
 			// Write T and G values to cache.
 			writeCache(
 				P,
-				collected_gaussian_offset[j],
+				collected_id[j],
 				pix_id,
 				collected_bbx_min[j],
 				collected_bbx_max[j],
@@ -674,7 +670,6 @@ void FORWARD::renderCache(
 	uint32_t* n_contrib,
 	const float* bg_color,
 	const float* depth,
-	const uint32_t* gaussian_offset,
 	const uint2* bbx_min,
 	const uint2* bbx_max,
 	const uint32_t* cache_offset,
@@ -692,7 +687,6 @@ void FORWARD::renderCache(
 		n_contrib,
 		bg_color,
 		depth,
-		gaussian_offset,
 		bbx_min,
 		bbx_max,
 		cache_offset,
@@ -855,125 +849,36 @@ __device__ float fetchTransmittanceValue(
 	return t_value[offset + (pix_id - (min.x + min.y * bbx_size.x))];
 }
 
-
-// Main rasterization method. Collaboratively works on one tile per
-// block, each thread treats one pixel. Alternates between fetching 
-// and rasterizing data.
-template <uint32_t CHANNELS>
-__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
-computeCacheLayoutCUDA(
-	const uint2* __restrict__ ranges,
-	const uint32_t* __restrict__ point_list,
-	int W, int H,
-	const float2* __restrict__ points_xy_image,
-	const float* __restrict__ features,
-	const float4* __restrict__ conic_opacity,
-	float* __restrict__ final_T,
-	uint32_t* __restrict__ n_contrib,
-	const float* __restrict__ bg_color,
-	const float* __restrict__ depth,
-	uint32_t* __restrict__ out_cache_counts_per_gaussian,
-	uint32_t* __restrict__ out_total_cache_count)
+__global__ void computeCacheLayoutCUDA(
+	int P,
+	const uint2* bbx_min,
+	const uint2* bbx_max,
+	uint32_t* out_cache_counts_per_gaussian)
 {
-	// Identify current tile and associated min/max pixel range.
-	auto block = cg::this_thread_block();
-	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
-	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
-	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
-	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
-	//uint32_t pix_id = W * pix.y + pix.x;
-	float2 pixf = { (float)pix.x, (float)pix.y };
+	// Identify current thread index
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= P)
+		return;
 
-	// Check if this thread is associated with a valid pixel or outside.
-	bool inside = pix.x < W&& pix.y < H;
-	// Done threads can help with fetching, but don't rasterize
-	bool done = !inside;
+	// Initialize cache count for this Gaussian to 0
+	uint32_t cache_count = 0;
 
-	// Load start/end range of IDs to process in bit sorted list.
-	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
-	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
-	int toDo = range.y - range.x;
+	// Compute bounding box size
+	uint2 bbx_size = { bbx_max[idx].x - bbx_min[idx].x, bbx_max[idx].y - bbx_min[idx].y };
 
-	// Allocate storage for batches of collectively fetched data.
-	__shared__ int collected_id[BLOCK_SIZE];
-	__shared__ float2 collected_xy[BLOCK_SIZE];
-	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
-	__shared__ float collected_depth[BLOCK_SIZE];
-
-	// Initialize helper variables
-	float T = 1.0f;
-	uint32_t contributor = 0;
-	uint32_t last_contributor = 0;
-
-	// Iterate over batches until all done or range is complete
-	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+	// If the bounding box is invalid, return
+	if (bbx_size.x == 0 || bbx_size.y == 0)
 	{
-		// End if entire block votes that it is done rasterizing
-		int num_done = __syncthreads_count(done);
-		if (num_done == BLOCK_SIZE)
-			break;
-
-		// Collectively fetch per-Gaussian data from global to shared
-		int progress = i * BLOCK_SIZE + block.thread_rank();
-		if (range.x + progress < range.y)
-		{
-			int coll_id = point_list[range.x + progress];
-			collected_id[block.thread_rank()] = coll_id;
-			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
-			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
-			collected_depth[block.thread_rank()] = depth[coll_id];
-		}
-		block.sync();
-
-		// Iterate over current batch
-		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
-		{
-			// Keep track of current position in range
-			contributor++;
-
-			// Resample using conic matrix (cf. "Surface 
-			// Splatting" by Zwicker et al., 2001)
-			float2 xy = collected_xy[j];
-			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
-			float4 con_o = collected_conic_opacity[j];
-			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
-			if (power > 0.0f)
-				continue;
-
-			// Eq. (2) from 3D Gaussian splatting paper.
-			// Obtain alpha by multiplying with Gaussian opacity
-			// and its exponential falloff from mean.
-			// Avoid numerical instabilities (see paper appendix). 
-			float alpha = min(0.99f, con_o.w * exp(power));
-			if (alpha < 1.0f / 255.0f)
-				continue;
-			float test_T = T * (1 - alpha);
-			if (test_T < 0.0001f)
-			{
-				done = true;
-				continue;
-			}
-
-
-			T = test_T;
-
-			// Keep track of last range entry to update this
-			// pixel.
-			last_contributor = contributor;
-
-			// Increment total cache count
-			atomicAdd(out_total_cache_count, 1);
-			
-			// Increment number of cache entries per Gaussian
-			atomicAdd(&out_cache_counts_per_gaussian[collected_id[j]], 1);
-
-		}
+		out_cache_counts_per_gaussian[idx] = 0;
+		return;
 	}
+
+	// Compute number of pixels in the bounding box
+	cache_count = bbx_size.x * bbx_size.y;
+
+	// Store the cache count for this Gaussian
+	out_cache_counts_per_gaussian[idx] = cache_count;
 }
-
-
-
-
 
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
@@ -997,7 +902,6 @@ flowRenderCUDA(
 	float* __restrict__ out_color,
 	const float* __restrict__ depth,
 	float* __restrict__ out_depth,
-	const uint32_t* __restrict__ gaussian_offset,
 	const uint2* __restrict__ bbx_min,
 	const uint2* __restrict__ bbx_max,
 	const uint32_t* __restrict__ cache_offset,
@@ -1034,7 +938,6 @@ flowRenderCUDA(
 	__shared__ float3 collected_sqrt_conic[BLOCK_SIZE];
 	__shared__ float3 collected_prev_sqrt_cov2D[BLOCK_SIZE];
 
-	__shared__ uint32_t collected_gaussian_offset[BLOCK_SIZE];
 	__shared__ uint2 collected_bbx_min[BLOCK_SIZE];
 	__shared__ uint2 collected_bbx_max[BLOCK_SIZE];
 	__shared__ uint32_t collected_cache_offset[BLOCK_SIZE];
@@ -1072,11 +975,9 @@ flowRenderCUDA(
 			collected_sqrt_conic[block.thread_rank()] = sqrt_conic[coll_id];
 			collected_prev_sqrt_cov2D[block.thread_rank()] = prev_sqrt_cov2D[coll_id];
 
-			uint32_t g_offset = gaussian_offset[coll_id];
-			collected_gaussian_offset[block.thread_rank()] = g_offset;
-			collected_bbx_min[block.thread_rank()] = bbx_min[g_offset];
-			collected_bbx_max[block.thread_rank()] = bbx_max[g_offset];
-			collected_cache_offset[block.thread_rank()] = cache_offset[g_offset];
+			collected_bbx_min[block.thread_rank()] = bbx_min[coll_id];
+			collected_bbx_max[block.thread_rank()] = bbx_max[coll_id];
+			collected_cache_offset[block.thread_rank()] = cache_offset[coll_id];
 		}
 		block.sync();
 
@@ -1166,7 +1067,7 @@ flowRenderCUDA(
 			float T_prev, G_prev;
 			readCache(
 				P,
-				collected_gaussian_offset[j],
+				collected_id[j],
 				pix_id,
 				collected_bbx_min[j],
 				collected_bbx_max[j],
@@ -1222,33 +1123,16 @@ flowRenderCUDA(
 }
 
 void FORWARD::FLOW::computeCacheLayout(
-	const dim3 grid, dim3 block,
-	const uint2* ranges,
-	const uint32_t* point_list,
-	int W, int H,
-	const float2* means2D,
-	const float* colors,
-	const float4* conic_opacity,
-	float* final_T,
-	uint32_t* n_contrib,
-	const float* bg_color,
-	const float* depth,
-	uint32_t* out_cache_counts_per_gaussian,
-	uint32_t* out_total_cache_count) 
+	int P,
+	const uint2* bbx_min,
+	const uint2* bbx_max,
+	uint32_t* out_cache_counts_per_gaussian) 
 {
-	computeCacheLayoutCUDA<NUM_CHANNELS> << <grid, block >> > (
-		ranges,
-		point_list,
-		W, H,
-		means2D,
-		colors,
-		conic_opacity,
-		final_T,
-		n_contrib,
-		bg_color,
-		depth,
-		out_cache_counts_per_gaussian,
-		out_total_cache_count);
+	computeCacheLayoutCUDA<< <(P + 255) / 256, 256 >> > (
+		P,
+		bbx_min,
+		bbx_max,
+		out_cache_counts_per_gaussian);
 }
 
 void FORWARD::FLOW::render(
@@ -1269,7 +1153,6 @@ void FORWARD::FLOW::render(
 	float* out_color,
 	const float* depth,
 	float* out_depth,
-	const uint32_t* gaussian_offset,
 	const uint2* bbx_min,
 	const uint2* bbx_max,
 	const uint32_t* cache_offset,
@@ -1294,7 +1177,6 @@ void FORWARD::FLOW::render(
 		out_color,
 		depth,
 		out_depth,
-		gaussian_offset,
 		bbx_min,
 		bbx_max,
 		cache_offset,
