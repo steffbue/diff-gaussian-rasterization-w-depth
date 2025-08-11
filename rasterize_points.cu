@@ -326,8 +326,11 @@ RasterizeGaussiansFlowCUDA(
 		projmatrix.contiguous().data<float>(),
 		campos.contiguous().data<float>(),
 		gaussianOffsetBuffer.contiguous().data<char>(),
+		gaussianOffsetBuffer.numel(),
 		gaussianHeaderBuffer.contiguous().data<char>(),
+		gaussianHeaderBuffer.numel(),
 		cacheBuffer.contiguous().data<char>(),
+		cacheBuffer.numel(),
 		tan_fovx,
 		tan_fovy,
 		prefiltered,
@@ -343,24 +346,22 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 createCache(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
-	const torch::Tensor& radii,
     const torch::Tensor& colors,
+    const torch::Tensor& opacity,
 	const torch::Tensor& scales,
 	const torch::Tensor& rotations,
 	const float scale_modifier,
 	const torch::Tensor& cov3D_precomp,
 	const torch::Tensor& viewmatrix,
-    const torch::Tensor& projmatrix,
+	const torch::Tensor& projmatrix,
 	const float tan_fovx, 
 	const float tan_fovy,
-    const torch::Tensor& dL_dout_color,
+    const int image_height,
+    const int image_width,
 	const torch::Tensor& sh,
 	const int degree,
 	const torch::Tensor& campos,
-	const torch::Tensor& geomBuffer,
-	const int R,
-	const torch::Tensor& binningBuffer,
-	const torch::Tensor& imageBuffer,
+	const bool prefiltered,
 	const int device_id)
 {
   CUDA_CHECK(cudaSetDevice(device_id));
@@ -372,6 +373,8 @@ createCache(
   const int P = means3D.size(0);
   const int H = image_height;
   const int W = image_width;
+
+  torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
   
   torch::Device device(torch::kCUDA, device_id);
   torch::TensorOptions options(torch::kByte);
@@ -390,7 +393,6 @@ createCache(
   std::function<char*(size_t)> gaussianHeaderFunc = resizeFunctional(gaussianHeaderBuffer);
   std::function<char*(size_t)> cacheFunc = resizeFunctional(cacheBuffer);
 
-  int rendered = 0;
   if(P != 0)
   {
 	  int M = 0;
@@ -399,7 +401,7 @@ createCache(
 		M = sh.size(1);
       }
 
-	  rendered = CudaRasterizer::Rasterizer::createCache(
+	  CudaRasterizer::Rasterizer::createCache(
 	    geomFunc,
 		binningFunc,
 		imgFunc,

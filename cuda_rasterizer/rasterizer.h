@@ -13,6 +13,7 @@
 #define CUDA_RASTERIZER_H_INCLUDED
 
 #include <vector>
+#include <cstdint>
 #include <functional>
 
 namespace CudaRasterizer
@@ -86,6 +87,9 @@ namespace CudaRasterizer
 			std::function<char* (size_t)> geometryBuffer,
 			std::function<char* (size_t)> binningBuffer,
 			std::function<char* (size_t)> imageBuffer,
+			std::function<char* (size_t)> gaussianOffsetBuffer,
+			std::function<char* (size_t)> gaussianHeaderBuffer,
+			std::function<char* (size_t)> cacheBuffer,
 			const int P, int D, int M,
 			const float* background,
 			const int width, int height,
@@ -140,9 +144,12 @@ namespace CudaRasterizer
 			const float* viewmatrix,
 			const float* projmatrix,
 			const float* cam_pos,
-			const char* gaussianOffsetBuffer,
-			const char* gaussianHeaderBuffer,
-			const char* cacheBuffer,
+			char* gaussianOffsetBuffer,
+			const uint32_t gaussianOffsetBufferSize,
+			char* gaussianHeaderBuffer,
+			const uint32_t gaussianHeaderBufferSize,
+			char* cacheBuffer,
+			const uint32_t cacheBufferSize,
 			const float tan_fovx, float tan_fovy,
 			const bool prefiltered,
 			float* out_color,
