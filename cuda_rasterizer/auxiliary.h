@@ -55,6 +55,18 @@ __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& r
 	};
 }
 
+__forceinline__ __device__ void tileToPixelRect(const uint2 rect_min, const uint2 rect_max, int W, int H, uint2& pix_min, uint2& pix_max)
+{
+	pix_min = {
+		(unsigned)min((int)W, max((int)0, (int)(rect_min.x * BLOCK_X))),
+		(unsigned)min((int)H, max((int)0, (int)(rect_min.y * BLOCK_Y)))
+	};
+	pix_max = {
+		(unsigned)min((int)W, max((int)0, (int)(rect_max.x * BLOCK_X))),
+		(unsigned)min((int)H, max((int)0, (int)(rect_max.y * BLOCK_Y)))
+	};
+}
+
 __forceinline__ __device__ float3 transformPoint4x3(const float3& p, const float* matrix)
 {
 	float3 transformed = {

@@ -43,6 +43,8 @@ namespace FORWARD
 		float* cov3Ds,
 		float* colors,
 		float4* conic_opacity,
+		uint2* bbx_min,
+		uint2* bbx_max,
 		const dim3 grid,
 		uint32_t* tiles_touched,
 		bool prefiltered);
@@ -62,6 +64,96 @@ namespace FORWARD
 		float* out_color,
 		const float* depth,
 	    float* out_depth);
+
+	// Render cache values for each pixel.
+	void renderCache(
+		const dim3 grid, dim3 block,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		int W, int H, int P,
+		const float2* points_xy_image,
+		const float* features,
+		const float4* conic_opacity,
+		float* final_T,
+		uint32_t* n_contrib,
+		const float* bg_color,
+		const float* depth,
+		const uint2* bbx_min,
+		const uint2* bbx_max,
+		const uint64_t* cache_offset,
+		float* t_value,
+		float* g_value);
+
+	void computeCacheLayout(
+		int P, int W, int H,
+		uint2* bbx_min,
+		uint2* bbx_max,
+		uint64_t* out_cache_counts_per_gaussian); 
+
+	namespace FLOW 
+	{
+		// Perform initial steps for each Gaussian prior to rasterization.
+		void preprocess(int P, int D, int M,
+			const float* orig_points,
+			const float* prev_orig_points,
+			const glm::vec3* scales,
+			const glm::vec3* prev_scales,
+			const float scale_modifier,
+			const glm::vec4* rotations,
+			const glm::vec4* prev_rotations,
+			const float* opacities,
+			const float* prev_opacities,
+			const float* shs,
+			bool* clamped,
+			const float* cov3D_precomp,
+			const float* prev_cov3D_precomp,
+			const float* colors_precomp,
+			const float* viewmatrix,
+			const float* projmatrix,
+			const glm::vec3* cam_pos,
+			const int W, int H,
+			const float focal_x, float focal_y,
+			const float tan_fovx, float tan_fovy,
+			int* radii,
+			float2* points_xy_image,
+			float2* prev_points_xy_image,
+			float* depths,
+			float* cov3Ds,
+			float* colors,
+			float4* conic_opacity,
+			const dim3 grid,
+			uint32_t* tiles_touched,
+			float4* prev_cov2D_opacity,
+			float3* sqrt_conic,
+			float3* prev_sqrt_cov2D,
+			bool prefiltered);
+
+		// Main rasterization method.
+		void render(
+			const dim3 grid, dim3 block,
+			const uint2* ranges,
+			const uint32_t* point_list,
+			int P, int W, int H,
+			const float2* means2D,
+			const float2* prev_means2D,
+			const float* colors,
+			const float4* conic_opacity,
+			const float4* prev_cov2D_opacity,
+			const float3* sqrt_conic,
+			const float3* prev_sqrt_cov2D,
+			float* final_T,
+			uint32_t* n_contrib,
+			const float* bg_color,
+			float* out_color,
+			const float* depth,
+			float* out_depth,
+			const uint2* bbx_min,
+			const uint2* bbx_max,
+			const uint64_t* cache_offset,
+			const float* t_value,
+			const float* g_value,
+			float* out_flow);
+	}
 }
 
 

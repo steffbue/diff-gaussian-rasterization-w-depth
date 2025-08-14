@@ -40,8 +40,20 @@ namespace CudaRasterizer
 		float* rgb;
 		uint32_t* point_offsets;
 		uint32_t* tiles_touched;
+		uint2* bbx_min;
+		uint2* bbx_max;
 
 		static GeometryState fromChunk(char*& chunk, size_t P);
+	};
+
+	struct FlowState
+	{
+		float2* prev_means2D;
+		float4* prev_cov2D_opacity;
+		float3* sqrt_conic;
+		float3* prev_sqrt_cov2D;
+
+		static FlowState fromChunk(char*& chunk, size_t P);
 	};
 
 	struct ImageState
@@ -65,6 +77,23 @@ namespace CudaRasterizer
 		static BinningState fromChunk(char*& chunk, size_t P);
 	};
 
+	struct GaussianHeaderState
+	{
+		uint2* bbx_min;
+		uint2* bbx_max;
+		uint64_t* cache_offset;
+
+		static GaussianHeaderState fromChunk(char*& chunk, size_t P);
+	};
+
+	struct CacheState
+	{
+		float* t_value;
+		float* g_value;
+
+		static CacheState fromChunk(char*& chunk, size_t N);
+	};
+
 	template<typename T> 
 	size_t required(size_t P)
 	{
@@ -72,4 +101,19 @@ namespace CudaRasterizer
 		T::fromChunk(size, P);
 		return ((size_t)size) + 128;
 	}
+
+	void allocateCache(
+		int P, dim3 tile_grid, dim3 block,
+		const ImageState& imgState,
+		const BinningState& binningState,
+		const GeometryState& geomState,
+		std::function<char* (size_t)> gaussianHeaderBuffer,
+		std::function<char* (size_t)> cacheBuffer,
+		const int width, const int height,
+		const float* feature_ptr,
+		const float* bg_color,
+		const float* depth,
+		GaussianHeaderState& out_gaussianHeaderState,
+		CacheState& out_cacheState
+	);
 };
