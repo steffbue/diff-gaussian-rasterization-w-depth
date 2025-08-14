@@ -43,6 +43,9 @@ namespace CudaRasterizer
 		uint2* bbx_min;
 		uint2* bbx_max;
 
+		uint2* bbx_min;
+		uint2* bbx_max;
+
 		static GeometryState fromChunk(char*& chunk, size_t P);
 	};
 

@@ -122,6 +122,87 @@ __device__ float3 computeCov2D(const float3& mean, float focal_x, float focal_y,
 	return { float(cov[0][0]), float(cov[0][1]), float(cov[1][1]) };
 }
 
+// Helper function to read cache
+__device__ void readCache(
+	const uint32_t P,
+	const uint32_t g_index,
+	const uint32_t pix_id,
+	const uint2 bbx_min,
+	const uint2 bbx_max,
+	const uint32_t cache_offset,
+	const float* __restrict__ t_value,
+	const float* __restrict__ g_value,
+	float* out_T,
+	float* out_G)
+{
+	// If the Gaussian index is out of bounds, return 0.0f (no contribution)
+	if (g_index >= P)
+	{
+		*out_T = 0.0f;
+		*out_G = 0.0f;
+		return;
+	}
+
+	// Compute bounding box size
+	uint2 bbx_size = { bbx_max.x - bbx_min.x, bbx_max.y - bbx_min.y };
+
+	// If the bounding box is invalid or pixel id is outside the bounding box, return 0.0f
+	bool invalid_bbx = (bbx_size.x == 0 || bbx_size.y == 0);
+	bool outside_bbx = (pix_id < bbx_min.x + bbx_min.y * bbx_size.x || pix_id > bbx_max.x + bbx_max.y * bbx_size.x);
+
+	if (invalid_bbx || outside_bbx)
+	{
+		*out_T = 0.0f;
+		*out_G = 0.0f;
+		return;
+	}
+
+	// Compute offset in cache arrays
+	uint32_t offset = cache_offset;
+
+	*out_T = t_value[offset + (pix_id - (bbx_min.x + bbx_min.y * bbx_size.x))];
+	*out_G = g_value[offset + (pix_id - (bbx_min.x + bbx_min.y * bbx_size.x))];
+}
+
+// Helper function to write cache
+__device__ void writeCache(
+	const uint32_t P,
+	const uint32_t g_index,
+	const uint32_t pix_id,
+	const uint2 bbx_min,
+	const uint2 bbx_max,
+	const uint32_t cache_offset,
+	float* __restrict__ t_value,
+	float* __restrict__ g_value,
+	const float T,
+	const float G)
+{
+	// If the Gaussian index is out of bounds, return
+	if (g_index >= P)
+	{
+		return;
+	}
+
+	// Compute bounding box size
+	uint2 bbx_size = { bbx_max.x - bbx_min.x, bbx_max.y - bbx_min.y };
+
+	// If the bounding box is invalid or pixel id is outside the bounding box, return
+	bool invalid_bbx = (bbx_size.x == 0 || bbx_size.y == 0);
+	bool outside_bbx = (pix_id < bbx_min.x + bbx_min.y * bbx_size.x || pix_id > bbx_max.x + bbx_max.y * bbx_size.x);
+
+	if (invalid_bbx || outside_bbx)
+	{
+		return;
+	}
+
+	// Compute offset in cache arrays
+	uint32_t offset = cache_offset;
+
+	t_value[offset + (pix_id - (bbx_min.x + bbx_min.y * bbx_size.x))] = T;
+	g_value[offset + (pix_id - (bbx_min.x + bbx_min.y * bbx_size.x))] = G;
+}
+
+
 // Forward method for converting scale and rotation properties of each
 // Gaussian to a 3D covariance matrix in world space. Also takes care
 // of quaternion normalization.
@@ -414,6 +495,161 @@ renderCUDA(
 	}
 }
 
+// Main rasterization method. Collaboratively works on one tile per
+// block, each thread treats one pixel. Alternates between fetching 
+// and rasterizing data.
+template <uint32_t CHANNELS>
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+renderCacheCUDA(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int W, int H, int P,
+	const float2* __restrict__ points_xy_image,
+	const float* __restrict__ features,
+	const float4* __restrict__ conic_opacity,
+	float* __restrict__ final_T,
+	uint32_t* __restrict__ n_contrib,
+	const float* __restrict__ bg_color,
+	const float* __restrict__ depth,
+	const uint2* __restrict__ bbx_min,
+	const uint2* __restrict__ bbx_max,
+	const uint32_t* __restrict__ cache_offset,
+	float* __restrict__ t_value,
+	float* __restrict__ g_value)
+{
+	// Identify current tile and associated min/max pixel range.
+	auto block = cg::this_thread_block();
+	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
+	uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+	uint32_t pix_id = W * pix.y + pix.x;
+	float2 pixf = { (float)pix.x, (float)pix.y };
+
+	// Check if this thread is associated with a valid pixel or outside.
+	bool inside = pix.x < W&& pix.y < H;
+	// Done threads can help with fetching, but don't rasterize
+	bool done = !inside;
+
+	// Load start/end range of IDs to process in bit sorted list.
+	uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+	int toDo = range.y - range.x;
+
+	// Allocate storage for batches of collectively fetched data.
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	__shared__ float collected_depth[BLOCK_SIZE];
+	
+	__shared__ uint2 collected_bbx_min[BLOCK_SIZE];
+	__shared__ uint2 collected_bbx_max[BLOCK_SIZE];
+	__shared__ uint32_t collected_cache_offset[BLOCK_SIZE];
+
+	// Initialize helper variables
+	float T = 1.0f;
+	uint32_t contributor = 0;
+	uint32_t last_contributor = 0;
+	float C[CHANNELS] = { 0 };
+// 	float D = 0.0f;  // Mean Depth
+    float D = 15.0f;  // Median Depth. TODO: This is a hack setting max_depth to 15
+
+	// Iterate over batches until all done or range is complete
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+	{
+		// End if entire block votes that it is done rasterizing
+		int num_done = __syncthreads_count(done);
+		if (num_done == BLOCK_SIZE)
+			break;
+
+		// Collectively fetch per-Gaussian data from global to shared
+		int progress = i * BLOCK_SIZE + block.thread_rank();
+		if (range.x + progress < range.y)
+		{
+			int coll_id = point_list[range.x + progress];
+			collected_id[block.thread_rank()] = coll_id;
+			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			collected_depth[block.thread_rank()] = depth[coll_id];
+
+
+			collected_bbx_min[block.thread_rank()] = bbx_min[coll_id];
+			collected_bbx_max[block.thread_rank()] = bbx_max[coll_id];
+			collected_cache_offset[block.thread_rank()] = cache_offset[coll_id];
+		}
+		block.sync();
+
+		// Iterate over current batch
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		{
+			// Keep track of current position in range
+			contributor++;
+
+			// Resample using conic matrix (cf. "Surface 
+			// Splatting" by Zwicker et al., 2001)
+			float2 xy = collected_xy[j];
+			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			float4 con_o = collected_conic_opacity[j];
+			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			if (power > 0.0f)
+				continue;
+
+			// Eq. (2) from 3D Gaussian splatting paper.
+			// Obtain alpha by multiplying with Gaussian opacity
+			// and its exponential falloff from mean.
+			// Avoid numerical instabilities (see paper appendix). 
+			float alpha = min(0.99f, con_o.w * exp(power));
+			if (alpha < 1.0f / 255.0f)
+				continue;
+			float test_T = T * (1 - alpha);
+			if (test_T < 0.0001f)
+			{
+				done = true;
+				continue;
+			}
+
+			// Eq. (3) from 3D Gaussian splatting paper.
+			for (int ch = 0; ch < CHANNELS; ch++)
+				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
+
+            // Mean depth:
+//             float dep = collected_depth[j];
+//             D += dep * alpha * T;
+
+            // Median depth:
+            if (T > 0.5f && test_T < 0.5)
+			{
+			    float dep = collected_depth[j];
+				D = dep;
+			}
+
+			const float T_in = T;
+			const float G_in = exp(power);
+
+			// Write T and G values to cache.
+			writeCache(
+				P,
+				collected_id[j],
+				pix_id,
+				collected_bbx_min[j],
+				collected_bbx_max[j],
+				collected_cache_offset[j],
+				t_value,
+				g_value,
+				T_in,
+				G_in
+			);
+
+			T = test_T;
+
+			// Keep track of last range entry to update this
+			// pixel.
+			last_contributor = contributor;
+
+		}
+	}
+}
+
 void FORWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
@@ -442,6 +678,42 @@ void FORWARD::render(
 		out_color,
 		depth,
 		out_depth);
+}
+
+void FORWARD::renderCache(
+	const dim3 grid, dim3 block,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int W, int H, int P,
+	const float2* means2D,
+	const float* colors,
+	const float4* conic_opacity,
+	float* final_T,
+	uint32_t* n_contrib,
+	const float* bg_color,
+	const float* depth,
+	const uint2* bbx_min,
+	const uint2* bbx_max,
+	const uint32_t* cache_offset,
+	float* t_value,
+	float* g_value)
+{
+	renderCacheCUDA<NUM_CHANNELS> << <grid, block >> > (
+		ranges,
+		point_list,
+		W, H, P,
+		means2D,
+		colors,
+		conic_opacity,
+		final_T,
+		n_contrib,
+		bg_color,
+		depth,
+		bbx_min,
+		bbx_max,
+		cache_offset,
+		t_value,
+		g_value);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
