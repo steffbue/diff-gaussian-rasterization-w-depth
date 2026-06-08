@@ -11,6 +11,7 @@
 
 #include "backward.h"
 #include "auxiliary.h"
+#include "sym2.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
@@ -654,4 +655,494 @@ void BACKWARD::render(
 		dL_dopacity,
 		dL_dcolors
 		);
+}
+
+// ============================================================================
+//  Differentiable optical-flow backward pass
+//  Mirrors the colour render/preprocess backward, with one extra term per
+//  Gaussian for the flow output. See docs/flow-backward-design.md for the
+//  full derivation.
+// ============================================================================
+
+// Backward of computeSquareRootCov2D. Uses the closed form for the matrix
+// square root of a symmetric PSD 2x2 matrix:
+//   s = sqrt(det),  t = sqrt(trace + 2s),  sqrt(M) = (M + s*I) / t
+// Given dL/d(sqrt(M)) = (X̄, Ȳ, Z̄) it returns dL/dM = (ā, b̄, c̄), where both
+// matrices are stored as float3 {a, b, c} = [[a, b], [b, c]] and the
+// off-diagonal b is treated as a single parameter (no factor-of-two here).
+__device__ float3 computeSquareRootCov2DBackward(const float3& cov2D, const float3& dL_dsqrt)
+{
+	// Adjoint of the symmetric matrix square root (sym2.h). Matches the forward
+	// computeSquareRootCov2D, which now also uses the sym2.h closed form.
+	return sqrt_sym2_vjp(cov2D, dL_dsqrt);
+}
+
+// Combined colour + flow render backward. Colour gradients are identical to
+// renderCUDA; the flow output adds (a) a contribution to dL/dalpha (Δ behaves
+// like a colour channel) and (b) a gradient through the displacement Δ itself,
+// routed into the 2D mean / sqrt-covariance quantities of both frames.
+template <uint32_t C>
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+diffFlowRenderBackwardCUDA(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int W, int H,
+	const float* __restrict__ bg_color,
+	const float2* __restrict__ points_xy_image,
+	const float2* __restrict__ prev_points_xy_image,
+	const float4* __restrict__ conic_opacity,
+	const float3* __restrict__ sqrt_conic,
+	const float3* __restrict__ prev_sqrt_cov2D,
+	const float* __restrict__ colors,
+	const float* __restrict__ final_Ts,
+	const uint32_t* __restrict__ n_contrib,
+	const float* __restrict__ dL_dpixels,
+	const float* __restrict__ dL_dflows,
+	float3* __restrict__ dL_dmean2D,
+	float4* __restrict__ dL_dconic2D,
+	float* __restrict__ dL_dopacity,
+	float* __restrict__ dL_dcolors,
+	float3* __restrict__ dL_dsqrt_conic,
+	float3* __restrict__ dL_dprev_mean2D,
+	float3* __restrict__ dL_dprev_sqrt_cov2D)
+{
+	auto block = cg::this_thread_block();
+	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+	const uint32_t pix_id = W * pix.y + pix.x;
+	const float2 pixf = { (float)pix.x, (float)pix.y };
+
+	const bool inside = pix.x < W&& pix.y < H;
+	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+	bool done = !inside;
+	int toDo = range.y - range.x;
+
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	__shared__ float collected_colors[C * BLOCK_SIZE];
+	__shared__ float2 collected_prev_xy[BLOCK_SIZE];
+	__shared__ float3 collected_sqrt_conic[BLOCK_SIZE];
+	__shared__ float3 collected_prev_sqrt_cov2D[BLOCK_SIZE];
+
+	const float T_final = inside ? final_Ts[pix_id] : 0;
+	float T = T_final;
+
+	uint32_t contributor = toDo;
+	const int last_contributor = inside ? n_contrib[pix_id] : 0;
+
+	float accum_rec[C] = { 0 };
+	float dL_dpixel[C];
+	float accum_rec_flow[2] = { 0 };
+	float dL_dflow[2] = { 0 };
+	if (inside)
+	{
+		for (int i = 0; i < C; i++)
+			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+		dL_dflow[0] = dL_dflows[pix_id];
+		dL_dflow[1] = dL_dflows[H * W + pix_id];
+	}
+
+	float last_alpha = 0;
+	float last_color[C] = { 0 };
+	float last_flow[2] = { 0 };
+
+	const float ddelx_dx = 0.5 * W;
+	const float ddely_dy = 0.5 * H;
+
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+	{
+		block.sync();
+		const int progress = i * BLOCK_SIZE + block.thread_rank();
+		if (range.x + progress < range.y)
+		{
+			const int coll_id = point_list[range.y - progress - 1];
+			collected_id[block.thread_rank()] = coll_id;
+			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			for (int ch = 0; ch < C; ch++)
+				collected_colors[ch * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + ch];
+			collected_prev_xy[block.thread_rank()] = prev_points_xy_image[coll_id];
+			collected_sqrt_conic[block.thread_rank()] = sqrt_conic[coll_id];
+			collected_prev_sqrt_cov2D[block.thread_rank()] = prev_sqrt_cov2D[coll_id];
+		}
+		block.sync();
+
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		{
+			contributor--;
+			if (contributor >= last_contributor)
+				continue;
+
+			const float2 xy = collected_xy[j];
+			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			const float4 con_o = collected_conic_opacity[j];
+			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			if (power > 0.0f)
+				continue;
+
+			const float G = exp(power);
+			const float alpha = min(0.99f, con_o.w * G);
+			if (alpha < 1.0f / 255.0f)
+				continue;
+
+			T = T / (1.f - alpha);
+			const float dchannel_dcolor = alpha * T;
+			const int global_id = collected_id[j];
+
+			// Colour: propagate to per-Gaussian colours, accumulate dL/dalpha.
+			float dL_dalpha = 0.0f;
+			for (int ch = 0; ch < C; ch++)
+			{
+				const float c = collected_colors[ch * BLOCK_SIZE + j];
+				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+				last_color[ch] = c;
+
+				const float dL_dchannel = dL_dpixel[ch];
+				dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+			}
+
+			// Reconstruct the per-pixel displacement Δ = computePrevPos(p) - p,
+			// expressed with the sym2.h whitening primitives (matches forward).
+			const Sym2 S = collected_sqrt_conic[j];        // sqrt(conic_curr): whiten
+			const Sym2 P = collected_prev_sqrt_cov2D[j];   // sqrt(cov2D_prev): de-whiten
+			const Vec2 mu_prev = collected_prev_xy[j];
+			const Vec2 diff = v_sub(pixf, xy);             // p - mu_curr  (= -d)
+			const Vec2 norm_pos = symv(S, diff);           // into current unit frame
+			const Vec2 prev = v_add(symv(P, norm_pos), mu_prev);
+			const float dflowx = prev.x - pixf.x;   // Δ.x
+			const float dflowy = prev.y - pixf.y;   // Δ.y
+
+			// Flow contribution to dL/dalpha (Δ behaves like a colour channel).
+			accum_rec_flow[0] = last_alpha * last_flow[0] + (1.f - last_alpha) * accum_rec_flow[0];
+			accum_rec_flow[1] = last_alpha * last_flow[1] + (1.f - last_alpha) * accum_rec_flow[1];
+			last_flow[0] = dflowx;
+			last_flow[1] = dflowy;
+			dL_dalpha += (dflowx - accum_rec_flow[0]) * dL_dflow[0]
+			           + (dflowy - accum_rec_flow[1]) * dL_dflow[1];
+
+			dL_dalpha *= T;
+			last_alpha = alpha;
+
+			// Background only contributes to the colour channels.
+			float bg_dot_dpixel = 0;
+			for (int ch = 0; ch < C; ch++)
+				bg_dot_dpixel += bg_color[ch] * dL_dpixel[ch];
+			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+
+			// Flow gradient through the displacement Δ directly:
+			// dL/dΔ = (alpha*T)·dL/dflow, routed through computePrevPos's adjoint.
+			// Each linear map y = M·v contributes dL/dM = sym_outer(dL/dy, v) and
+			// pulls back to v via M·(dL/dy) (M symmetric); this block is the
+			// literal transpose of the forward whitening above.
+			const Vec2 q = { dchannel_dcolor * dL_dflow[0], dchannel_dcolor * dL_dflow[1] };
+
+			// previous 2D centre  (prev = ... + mu_prev). mu_prev is in pixel
+			// units; convert the pixel-space gradient to the NDC convention the
+			// projection backward expects (d(pixel)/d(ndc) = 0.5*W, 0.5*H), as the
+			// colour mean path does via ddelx_dx/ddely_dy.
+			atomicAdd(&dL_dprev_mean2D[global_id].x, q.x * ddelx_dx);
+			atomicAdd(&dL_dprev_mean2D[global_id].y, q.y * ddely_dy);
+
+			// prev = P·norm_pos + mu_prev  ⇒  dL/dP, then pull back to norm_pos
+			const Sym2 dP = sym_outer(q, norm_pos);
+			atomicAdd(&dL_dprev_sqrt_cov2D[global_id].x, dP.x);
+			atomicAdd(&dL_dprev_sqrt_cov2D[global_id].y, dP.y);
+			atomicAdd(&dL_dprev_sqrt_cov2D[global_id].z, dP.z);
+			const Vec2 dnorm = symv(P, q);
+
+			// norm_pos = S·diff  ⇒  dL/dS, then pull back to diff = p - mu_curr
+			const Sym2 dS = sym_outer(dnorm, diff);
+			atomicAdd(&dL_dsqrt_conic[global_id].x, dS.x);
+			atomicAdd(&dL_dsqrt_conic[global_id].y, dS.y);
+			atomicAdd(&dL_dsqrt_conic[global_id].z, dS.z);
+
+			// dL/dmu_curr = -dL/ddiff = -S·dnorm. In pixel units; convert to the
+			// NDC convention (0.5*W, 0.5*H) before adding to the shared mean2D
+			// buffer, matching the colour mean path (ddelx_dx/ddely_dy).
+			const Vec2 dmu_curr = v_neg(symv(S, dnorm));
+			atomicAdd(&dL_dmean2D[global_id].x, dmu_curr.x * ddelx_dx);
+			atomicAdd(&dL_dmean2D[global_id].y, dmu_curr.y * ddely_dy);
+
+			// Standard alpha -> G -> {conic, mean2D, opacity}; dL/dalpha already
+			// carries both the colour and flow contributions.
+			const float dL_dG = con_o.w * dL_dalpha;
+			const float gdx = G * d.x;
+			const float gdy = G * d.y;
+			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+
+			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
+			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+
+			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
+			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
+			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+
+			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+		}
+	}
+}
+
+// Fold dL/d(sqrt_conic) of the current frame into the colour dL/d(conic) buffer
+// so the existing computeCov2DCUDA picks it up. dL_dconic layout matches the
+// colour path: {xx, xy, (yx unused), yy} per Gaussian.
+__global__ void addSqrtConicGradCUDA(int P,
+	const int* radii,
+	const float4* conic_opacity,
+	const float3* dL_dsqrt_conic,
+	float* dL_dconic)
+{
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= P || !(radii[idx] > 0))
+		return;
+
+	const float4 co = conic_opacity[idx];
+	const float3 conic = { co.x, co.y, co.z };
+	const float3 dL_dc = computeSquareRootCov2DBackward(conic, dL_dsqrt_conic[idx]);
+	dL_dconic[4 * idx + 0] += dL_dc.x;
+	dL_dconic[4 * idx + 1] += dL_dc.y;
+	dL_dconic[4 * idx + 3] += dL_dc.z;
+}
+
+// Backward of the previous-frame 2D covariance. Maps dL/d(sqrt(cov2D_prev)) to
+// dL/d(prev_cov3D) and the covariance-induced part of dL/d(prev_mean3D). Mirrors
+// computeCov2DCUDA but operates on the *plain* cov2D (no conic inversion) and
+// folds in the matrix-sqrt backward.
+__global__ void computeCov2DFlowBackwardCUDA(int P,
+	const float3* prev_means,
+	const int* radii,
+	const float* prev_cov3Ds,
+	const float h_x, float h_y,
+	const float tan_fovx, float tan_fovy,
+	const float* view_matrix,
+	const float3* prev_cov2D,
+	const float3* dL_dprev_sqrt_cov2D,
+	float3* dL_dprev_means,
+	float* dL_dprev_cov)
+{
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= P || !(radii[idx] > 0))
+		return;
+
+	const float* cov3D = prev_cov3Ds + 6 * idx;
+
+	// dL/d(prev cov2D) from dL/d(sqrt(prev cov2D)).
+	const float3 dL_dcov2D = computeSquareRootCov2DBackward(prev_cov2D[idx], dL_dprev_sqrt_cov2D[idx]);
+	const float dL_da = dL_dcov2D.x;
+	const float dL_db = dL_dcov2D.y;
+	const float dL_dc = dL_dcov2D.z;
+
+	float3 mean = prev_means[idx];
+	float3 t = transformPoint4x3(mean, view_matrix);
+
+	const float limx = 1.3f * tan_fovx;
+	const float limy = 1.3f * tan_fovy;
+	const float txtz = t.x / t.z;
+	const float tytz = t.y / t.z;
+	t.x = min(limx, max(-limx, txtz)) * t.z;
+	t.y = min(limy, max(-limy, tytz)) * t.z;
+
+	const float x_grad_mul = txtz < -limx || txtz > limx ? 0 : 1;
+	const float y_grad_mul = tytz < -limy || tytz > limy ? 0 : 1;
+
+	glm::mat3 J = glm::mat3(h_x / t.z, 0.0f, -(h_x * t.x) / (t.z * t.z),
+		0.0f, h_y / t.z, -(h_y * t.y) / (t.z * t.z),
+		0, 0, 0);
+	glm::mat3 W = glm::mat3(
+		view_matrix[0], view_matrix[4], view_matrix[8],
+		view_matrix[1], view_matrix[5], view_matrix[9],
+		view_matrix[2], view_matrix[6], view_matrix[10]);
+	glm::mat3 Vrk = glm::mat3(
+		cov3D[0], cov3D[1], cov3D[2],
+		cov3D[1], cov3D[3], cov3D[4],
+		cov3D[2], cov3D[4], cov3D[5]);
+	glm::mat3 T = W * J;
+
+	// dL/d(prev_cov3D) from dL/d(prev_cov2D) entries.
+	dL_dprev_cov[6 * idx + 0] = (T[0][0] * T[0][0] * dL_da + T[0][0] * T[1][0] * dL_db + T[1][0] * T[1][0] * dL_dc);
+	dL_dprev_cov[6 * idx + 3] = (T[0][1] * T[0][1] * dL_da + T[0][1] * T[1][1] * dL_db + T[1][1] * T[1][1] * dL_dc);
+	dL_dprev_cov[6 * idx + 5] = (T[0][2] * T[0][2] * dL_da + T[0][2] * T[1][2] * dL_db + T[1][2] * T[1][2] * dL_dc);
+	dL_dprev_cov[6 * idx + 1] = 2 * T[0][0] * T[0][1] * dL_da + (T[0][0] * T[1][1] + T[0][1] * T[1][0]) * dL_db + 2 * T[1][0] * T[1][1] * dL_dc;
+	dL_dprev_cov[6 * idx + 2] = 2 * T[0][0] * T[0][2] * dL_da + (T[0][0] * T[1][2] + T[0][2] * T[1][0]) * dL_db + 2 * T[1][0] * T[1][2] * dL_dc;
+	dL_dprev_cov[6 * idx + 4] = 2 * T[0][2] * T[0][1] * dL_da + (T[0][1] * T[1][2] + T[0][2] * T[1][1]) * dL_db + 2 * T[1][1] * T[1][2] * dL_dc;
+
+	// dL/dT (upper 2x3) and onward to the mean (same as computeCov2DCUDA).
+	float dL_dT00 = 2 * (T[0][0] * Vrk[0][0] + T[0][1] * Vrk[0][1] + T[0][2] * Vrk[0][2]) * dL_da +
+		(T[1][0] * Vrk[0][0] + T[1][1] * Vrk[0][1] + T[1][2] * Vrk[0][2]) * dL_db;
+	float dL_dT01 = 2 * (T[0][0] * Vrk[1][0] + T[0][1] * Vrk[1][1] + T[0][2] * Vrk[1][2]) * dL_da +
+		(T[1][0] * Vrk[1][0] + T[1][1] * Vrk[1][1] + T[1][2] * Vrk[1][2]) * dL_db;
+	float dL_dT02 = 2 * (T[0][0] * Vrk[2][0] + T[0][1] * Vrk[2][1] + T[0][2] * Vrk[2][2]) * dL_da +
+		(T[1][0] * Vrk[2][0] + T[1][1] * Vrk[2][1] + T[1][2] * Vrk[2][2]) * dL_db;
+	float dL_dT10 = 2 * (T[1][0] * Vrk[0][0] + T[1][1] * Vrk[0][1] + T[1][2] * Vrk[0][2]) * dL_dc +
+		(T[0][0] * Vrk[0][0] + T[0][1] * Vrk[0][1] + T[0][2] * Vrk[0][2]) * dL_db;
+	float dL_dT11 = 2 * (T[1][0] * Vrk[1][0] + T[1][1] * Vrk[1][1] + T[1][2] * Vrk[1][2]) * dL_dc +
+		(T[0][0] * Vrk[1][0] + T[0][1] * Vrk[1][1] + T[0][2] * Vrk[1][2]) * dL_db;
+	float dL_dT12 = 2 * (T[1][0] * Vrk[2][0] + T[1][1] * Vrk[2][1] + T[1][2] * Vrk[2][2]) * dL_dc +
+		(T[0][0] * Vrk[2][0] + T[0][1] * Vrk[2][1] + T[0][2] * Vrk[2][2]) * dL_db;
+
+	float dL_dJ00 = W[0][0] * dL_dT00 + W[0][1] * dL_dT01 + W[0][2] * dL_dT02;
+	float dL_dJ02 = W[2][0] * dL_dT00 + W[2][1] * dL_dT01 + W[2][2] * dL_dT02;
+	float dL_dJ11 = W[1][0] * dL_dT10 + W[1][1] * dL_dT11 + W[1][2] * dL_dT12;
+	float dL_dJ12 = W[2][0] * dL_dT10 + W[2][1] * dL_dT11 + W[2][2] * dL_dT12;
+
+	float tz = 1.f / t.z;
+	float tz2 = tz * tz;
+	float tz3 = tz2 * tz;
+
+	float dL_dtx = x_grad_mul * -h_x * tz2 * dL_dJ02;
+	float dL_dty = y_grad_mul * -h_y * tz2 * dL_dJ12;
+	float dL_dtz = -h_x * tz2 * dL_dJ00 - h_y * tz2 * dL_dJ11 + (2 * h_x * t.x) * tz3 * dL_dJ02 + (2 * h_y * t.y) * tz3 * dL_dJ12;
+
+	float3 dL_dmean = transformVec4x3Transpose({ dL_dtx, dL_dty, dL_dtz }, view_matrix);
+	dL_dprev_means[idx] = dL_dmean;
+}
+
+// Previous-frame: finish the mean3D gradient from the prev 2D mean projection,
+// and propagate prev cov3D to prev scale/rotation. No SH (prev has no colour).
+template<int C>
+__global__ void preprocessFlowBackwardCUDA(
+	int P,
+	const float3* prev_means,
+	const int* radii,
+	const glm::vec3* prev_scales,
+	const glm::vec4* prev_rotations,
+	const float scale_modifier,
+	const float* proj,
+	const float3* dL_dprev_mean2D,
+	glm::vec3* dL_dprev_means,
+	float* dL_dprev_cov3D,
+	glm::vec3* dL_dprev_scale,
+	glm::vec4* dL_dprev_rot)
+{
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= P || !(radii[idx] > 0))
+		return;
+
+	float3 m = prev_means[idx];
+	float4 m_hom = transformPoint4x4(m, proj);
+	float m_w = 1.0f / (m_hom.w + 0.0000001f);
+
+	glm::vec3 dL_dmean;
+	float mul1 = (proj[0] * m.x + proj[4] * m.y + proj[8] * m.z + proj[12]) * m_w * m_w;
+	float mul2 = (proj[1] * m.x + proj[5] * m.y + proj[9] * m.z + proj[13]) * m_w * m_w;
+	dL_dmean.x = (proj[0] * m_w - proj[3] * mul1) * dL_dprev_mean2D[idx].x + (proj[1] * m_w - proj[3] * mul2) * dL_dprev_mean2D[idx].y;
+	dL_dmean.y = (proj[4] * m_w - proj[7] * mul1) * dL_dprev_mean2D[idx].x + (proj[5] * m_w - proj[7] * mul2) * dL_dprev_mean2D[idx].y;
+	dL_dmean.z = (proj[8] * m_w - proj[11] * mul1) * dL_dprev_mean2D[idx].x + (proj[9] * m_w - proj[11] * mul2) * dL_dprev_mean2D[idx].y;
+
+	dL_dprev_means[idx] += dL_dmean;
+
+	if (prev_scales)
+		computeCov3D(idx, prev_scales[idx], scale_modifier, prev_rotations[idx], dL_dprev_cov3D, dL_dprev_scale, dL_dprev_rot);
+}
+
+void BACKWARD::DIFF_FLOW::render(
+	const dim3 grid, const dim3 block,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int W, int H,
+	const float* bg_color,
+	const float2* means2D,
+	const float2* prev_means2D,
+	const float4* conic_opacity,
+	const float3* sqrt_conic,
+	const float3* prev_sqrt_cov2D,
+	const float* colors,
+	const float* final_Ts,
+	const uint32_t* n_contrib,
+	const float* dL_dpixels,
+	const float* dL_dflows,
+	float3* dL_dmean2D,
+	float4* dL_dconic2D,
+	float* dL_dopacity,
+	float* dL_dcolors,
+	float3* dL_dsqrt_conic,
+	float3* dL_dprev_mean2D,
+	float3* dL_dprev_sqrt_cov2D)
+{
+	diffFlowRenderBackwardCUDA<NUM_CHANNELS> << <grid, block >> > (
+		ranges,
+		point_list,
+		W, H,
+		bg_color,
+		means2D,
+		prev_means2D,
+		conic_opacity,
+		sqrt_conic,
+		prev_sqrt_cov2D,
+		colors,
+		final_Ts,
+		n_contrib,
+		dL_dpixels,
+		dL_dflows,
+		dL_dmean2D,
+		dL_dconic2D,
+		dL_dopacity,
+		dL_dcolors,
+		dL_dsqrt_conic,
+		dL_dprev_mean2D,
+		dL_dprev_sqrt_cov2D);
+}
+
+void BACKWARD::DIFF_FLOW::preprocess(
+	int P,
+	const float3* prev_means3D,
+	const int* radii,
+	const glm::vec3* prev_scales,
+	const glm::vec4* prev_rotations,
+	const float scale_modifier,
+	const float* prev_cov3Ds,
+	const float4* conic_opacity,
+	const float3* prev_cov2D,
+	const float* viewmatrix,
+	const float* projmatrix,
+	const float focal_x, float focal_y,
+	const float tan_fovx, float tan_fovy,
+	const float3* dL_dsqrt_conic,
+	const float3* dL_dprev_sqrt_cov2D,
+	const float3* dL_dprev_mean2D,
+	float* dL_dconic,
+	glm::vec3* dL_dprev_mean3D,
+	float* dL_dprev_cov3D,
+	glm::vec3* dL_dprev_scale,
+	glm::vec4* dL_dprev_rot)
+{
+	// Current frame: fold the sqrt_conic gradient into the colour conic buffer
+	// (must run before computeCov2DCUDA in BACKWARD::preprocess).
+	addSqrtConicGradCUDA << <(P + 255) / 256, 256 >> > (
+		P, radii, conic_opacity, dL_dsqrt_conic, dL_dconic);
+
+	// Previous frame: sqrt(cov2D_prev) -> prev cov3D (+ cov part of prev mean3D).
+	computeCov2DFlowBackwardCUDA << <(P + 255) / 256, 256 >> > (
+		P,
+		prev_means3D,
+		radii,
+		prev_cov3Ds,
+		focal_x, focal_y,
+		tan_fovx, tan_fovy,
+		viewmatrix,
+		prev_cov2D,
+		dL_dprev_sqrt_cov2D,
+		dL_dprev_mean3D,
+		dL_dprev_cov3D);
+
+	// Previous frame: prev mean2D -> prev mean3D, prev cov3D -> prev scale/rot.
+	preprocessFlowBackwardCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
+		P,
+		prev_means3D,
+		radii,
+		prev_scales,
+		prev_rotations,
+		scale_modifier,
+		projmatrix,
+		dL_dprev_mean2D,
+		dL_dprev_mean3D,
+		dL_dprev_cov3D,
+		dL_dprev_scale,
+		dL_dprev_rot);
 }

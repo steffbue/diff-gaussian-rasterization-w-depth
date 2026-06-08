@@ -60,6 +60,60 @@ namespace BACKWARD
 		float* dL_dsh,
 		glm::vec3* dL_dscale,
 		glm::vec4* dL_drot);
+
+	// Differentiable optical-flow backward (colour + flow share alpha*T weights).
+	namespace DIFF_FLOW
+	{
+		// Combined colour + flow render backward.
+		void render(
+			const dim3 grid, dim3 block,
+			const uint2* ranges,
+			const uint32_t* point_list,
+			int W, int H,
+			const float* bg_color,
+			const float2* means2D,
+			const float2* prev_means2D,
+			const float4* conic_opacity,
+			const float3* sqrt_conic,
+			const float3* prev_sqrt_cov2D,
+			const float* colors,
+			const float* final_Ts,
+			const uint32_t* n_contrib,
+			const float* dL_dpixels,
+			const float* dL_dflows,
+			float3* dL_dmean2D,
+			float4* dL_dconic2D,
+			float* dL_dopacity,
+			float* dL_dcolors,
+			float3* dL_dsqrt_conic,
+			float3* dL_dprev_mean2D,
+			float3* dL_dprev_sqrt_cov2D);
+
+		// Fold current-frame sqrt_conic grad into dL_dconic, and propagate the
+		// previous-frame 2D gradients to prev mean3D / cov3D / scale / rotation.
+		void preprocess(
+			int P,
+			const float3* prev_means3D,
+			const int* radii,
+			const glm::vec3* prev_scales,
+			const glm::vec4* prev_rotations,
+			const float scale_modifier,
+			const float* prev_cov3Ds,
+			const float4* conic_opacity,
+			const float3* prev_cov2D,
+			const float* viewmatrix,
+			const float* projmatrix,
+			const float focal_x, float focal_y,
+			const float tan_fovx, float tan_fovy,
+			const float3* dL_dsqrt_conic,
+			const float3* dL_dprev_sqrt_cov2D,
+			const float3* dL_dprev_mean2D,
+			float* dL_dconic,
+			glm::vec3* dL_dprev_mean3D,
+			float* dL_dprev_cov3D,
+			glm::vec3* dL_dprev_scale,
+			glm::vec4* dL_dprev_rot);
+	}
 }
 
 #endif

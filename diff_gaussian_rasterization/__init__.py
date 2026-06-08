@@ -72,6 +72,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.sh_degree,
             raster_settings.campos,
             raster_settings.prefiltered,
+            raster_settings.device_id,
         )
 
         # Invoke C++/CUDA rasterizer
@@ -112,7 +113,8 @@ class _RasterizeGaussians(torch.autograd.Function):
                 geomBuffer,
                 num_rendered,
                 binningBuffer,
-                imgBuffer)
+                imgBuffer,
+                raster_settings.device_id)
 
         # Compute gradients for relevant tensors by invoking backward method
         grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)        
@@ -143,6 +145,7 @@ class GaussianRasterizationSettings(NamedTuple):
     sh_degree : int
     campos : torch.Tensor
     prefiltered : bool
+    device_id : int
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):
@@ -156,7 +159,8 @@ class GaussianRasterizer(nn.Module):
             visible = _C.mark_visible(
                 positions,
                 raster_settings.viewmatrix,
-                raster_settings.projmatrix)
+                raster_settings.projmatrix,
+                raster_settings.device_id)
             
         return visible
 
@@ -194,4 +198,222 @@ class GaussianRasterizer(nn.Module):
             cov3D_precomp,
             raster_settings, 
         )
+    
+def rasterize_gaussians_with_flow(
+    means3D,
+    prev_means3D,
+    means2D,
+    sh,
+    colors_precomp,
+    opacities,
+    scales,
+    prev_scales,
+    rotations,
+    prev_rotations,
+    cov3Ds_precomp,
+    prev_cov3Ds_precomp,
+    raster_settings,
+):
+    return _RasterizeGaussiansWithFlow.apply(
+        means3D,
+        prev_means3D,
+        means2D,
+        sh,
+        colors_precomp,
+        opacities,
+        scales,
+        prev_scales,
+        rotations,
+        prev_rotations,
+        cov3Ds_precomp,
+        prev_cov3Ds_precomp,
+        raster_settings,
+    )
+
+
+class _RasterizeGaussiansWithFlow(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        means3D,
+        prev_means3D,
+        means2D,
+        sh,
+        colors_precomp,
+        opacities,
+        scales,
+        prev_scales,
+        rotations,
+        prev_rotations,
+        cov3Ds_precomp,
+        prev_cov3Ds_precomp,
+        raster_settings,
+    ):
+        args = (
+            raster_settings.bg,
+            means3D,
+            prev_means3D,
+            colors_precomp,
+            opacities,
+            scales,
+            prev_scales,
+            rotations,
+            prev_rotations,
+            raster_settings.scale_modifier,
+            cov3Ds_precomp,
+            prev_cov3Ds_precomp,
+            raster_settings.viewmatrix,
+            raster_settings.projmatrix,
+            raster_settings.tanfovx,
+            raster_settings.tanfovy,
+            raster_settings.image_height,
+            raster_settings.image_width,
+            sh,
+            raster_settings.sh_degree,
+            raster_settings.campos,
+            raster_settings.prefiltered,
+            raster_settings.device_id,
+        )
+
+        # Returns: num_rendered, color, radii, geomBuf, flowBuf, binBuf, imgBuf, depth, flow
+        num_rendered, color, radii, geomBuffer, flowBuffer, binningBuffer, imgBuffer, depth, flow = \
+            _C.rasterize_gaussians_with_flow(*args)
+
+        ctx.raster_settings = raster_settings
+        ctx.num_rendered = num_rendered
+        ctx.save_for_backward(
+            colors_precomp, means3D, prev_means3D,
+            scales, prev_scales, rotations, prev_rotations,
+            cov3Ds_precomp, prev_cov3Ds_precomp,
+            radii, sh, geomBuffer, flowBuffer, binningBuffer, imgBuffer,
+        )
+        return color, radii, depth, flow
+
+    @staticmethod
+    def backward(ctx, grad_color, grad_radii, grad_depth, grad_flow):
+        num_rendered = ctx.num_rendered
+        raster_settings = ctx.raster_settings
+        (colors_precomp, means3D, prev_means3D,
+         scales, prev_scales, rotations, prev_rotations,
+         cov3Ds_precomp, prev_cov3Ds_precomp,
+         radii, sh, geomBuffer, flowBuffer, binningBuffer, imgBuffer) = ctx.saved_tensors
+
+        # Propagate colour + flow gradients through the dedicated flow backward.
+        args = (
+            raster_settings.bg,
+            means3D,
+            prev_means3D,
+            radii,
+            colors_precomp,
+            scales,
+            prev_scales,
+            rotations,
+            prev_rotations,
+            raster_settings.scale_modifier,
+            cov3Ds_precomp,
+            prev_cov3Ds_precomp,
+            raster_settings.viewmatrix,
+            raster_settings.projmatrix,
+            raster_settings.tanfovx,
+            raster_settings.tanfovy,
+            grad_color,
+            grad_flow,
+            sh,
+            raster_settings.sh_degree,
+            raster_settings.campos,
+            geomBuffer,
+            flowBuffer,
+            num_rendered,
+            binningBuffer,
+            imgBuffer,
+            raster_settings.device_id,
+        )
+
+        (grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D,
+         grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations,
+         grad_prev_means3D, grad_prev_cov3Ds_precomp, grad_prev_scales,
+         grad_prev_rotations) = _C.rasterize_gaussians_with_flow_backward(*args)
+
+        grads = (
+            grad_means3D,            # means3D
+            grad_prev_means3D,       # prev_means3D
+            grad_means2D,            # means2D
+            grad_sh,                 # sh
+            grad_colors_precomp,     # colors_precomp
+            grad_opacities,          # opacities
+            grad_scales,             # scales
+            grad_prev_scales,        # prev_scales
+            grad_rotations,          # rotations
+            grad_prev_rotations,     # prev_rotations
+            grad_cov3Ds_precomp,     # cov3Ds_precomp
+            grad_prev_cov3Ds_precomp,# prev_cov3Ds_precomp
+            None,                    # raster_settings
+        )
+        return grads
+
+
+class GaussianRasterizerWithFlow(nn.Module):
+    def __init__(self, raster_settings):
+        super().__init__()
+        self.raster_settings = raster_settings
+
+    def markVisible(self, positions):
+        with torch.no_grad():
+            raster_settings = self.raster_settings
+            visible = _C.mark_visible(
+                positions,
+                raster_settings.viewmatrix,
+                raster_settings.projmatrix,
+                raster_settings.device_id)
+        return visible
+
+    def forward(self, means3D, means2D, opacities, prev_means3D,
+                shs=None, colors_precomp=None,
+                scales=None, prev_scales=None,
+                rotations=None, prev_rotations=None,
+                cov3D_precomp=None, prev_cov3D_precomp=None):
+
+        raster_settings = self.raster_settings
+
+        if (shs is None and colors_precomp is None) or \
+           (shs is not None and colors_precomp is not None):
+            raise Exception('Please provide exactly one of either SHs or precomputed colors!')
+
+        if ((scales is None or rotations is None) and cov3D_precomp is None) or \
+           ((scales is not None or rotations is not None) and cov3D_precomp is not None):
+            raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
+
+        if shs is None:
+            shs = torch.Tensor([])
+        if colors_precomp is None:
+            colors_precomp = torch.Tensor([])
+        if scales is None:
+            scales = torch.Tensor([])
+        if prev_scales is None:
+            prev_scales = torch.Tensor([])
+        if rotations is None:
+            rotations = torch.Tensor([])
+        if prev_rotations is None:
+            prev_rotations = torch.Tensor([])
+        if cov3D_precomp is None:
+            cov3D_precomp = torch.Tensor([])
+        if prev_cov3D_precomp is None:
+            prev_cov3D_precomp = torch.Tensor([])
+
+        return rasterize_gaussians_with_flow(
+            means3D,
+            prev_means3D,
+            means2D,
+            shs,
+            colors_precomp,
+            opacities,
+            scales,
+            prev_scales,
+            rotations,
+            prev_rotations,
+            cov3D_precomp,
+            prev_cov3D_precomp,
+            raster_settings,
+        )
+
 

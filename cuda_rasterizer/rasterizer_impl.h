@@ -15,6 +15,7 @@
 #include <vector>
 #include "rasterizer.h"
 #include <cuda_runtime_api.h>
+#include <cstdint>
 
 namespace CudaRasterizer
 {
@@ -43,6 +44,17 @@ namespace CudaRasterizer
 		static GeometryState fromChunk(char*& chunk, size_t P);
 	};
 
+	struct FlowState
+	{
+		float2* prev_means2D;
+		float3* prev_cov2D;
+		float3* sqrt_conic;
+		float3* prev_sqrt_cov2D;
+		float* prev_cov3D;
+
+		static FlowState fromChunk(char*& chunk, size_t P);
+	};
+
 	struct ImageState
 	{
 		uint2* ranges;
@@ -64,7 +76,7 @@ namespace CudaRasterizer
 		static BinningState fromChunk(char*& chunk, size_t P);
 	};
 
-	template<typename T> 
+	template<typename T>
 	size_t required(size_t P)
 	{
 		char* size = nullptr;
