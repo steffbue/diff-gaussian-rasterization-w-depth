@@ -1128,7 +1128,7 @@ void BACKWARD::DIFF_FLOW::preprocess(
 		viewmatrix,
 		prev_cov2D,
 		dL_dprev_sqrt_cov2D,
-		dL_dprev_mean3D,
+		(float3*)dL_dprev_mean3D,
 		dL_dprev_cov3D);
 
 	// Previous frame: prev mean2D -> prev mean3D, prev cov3D -> prev scale/rot.
