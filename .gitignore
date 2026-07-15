@@ -3,3 +3,4 @@ diff_gaussian_rasterization.egg-info/
 dist/
 .idea/
 .codegraph/
+__pycache__/
