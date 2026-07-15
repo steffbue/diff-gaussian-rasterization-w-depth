@@ -58,15 +58,36 @@ __forceinline__ __device__ Sym2 sym_outer(const Vec2& q, const Vec2& v)
 	         q.y * v.y };
 }
 
+// eps floor for `det` inside sqrt_sym2/sqrt_sym2_vjp exists only to guard
+// against floating-point noise pushing a near-singular (truly ~0) det
+// slightly negative before the sqrtf -- it must NOT engage for a legitimate,
+// well-conditioned PSD matrix that simply has a small *absolute* det. That
+// happens routinely for `conic` (= inverse of the projected 2D covariance):
+// det(conic) = 1/det(cov), which is already <1e-6 for any moderately large
+// (not even degenerate) on-screen covariance, e.g. det(cov) > 1e6. A fixed
+// absolute eps=1e-6f (as before) silently clamps `s`/`t` upward in exactly
+// that routine case, corrupting sqrt_conic (and its gradient) even though
+// the input matrix was perfectly well-conditioned -- confirmed on a real
+// trained scene: sqrt_sym2(conic) stopped satisfying sqrt(conic)^2==conic
+// once det(cov) exceeded ~1e6, while remaining exact in float64 once this
+// eps is scaled relative to the matrix's own magnitude instead of fixed.
+// Two floors are needed, in different units: `det` has units of value^2
+// (a*c), `tr + 2s` has units of value^1 (a+c). Both scaled relative to `tr`
+// so neither engages for a legitimate, merely-small-magnitude matrix --
+// only for genuine near-zero/negative floating-point noise around a truly
+// singular input.
+__forceinline__ __device__ float sym2DetEps(float tr) { return fmaxf(1e-30f, tr * tr * 1e-12f); }
+__forceinline__ __device__ float sym2TEps(float tr)   { return fmaxf(1e-15f, tr * 1e-6f); }
+
 // --- matrix square root of a symmetric PSD 2x2 (closed form) ---------------
 // For PSD symmetric M this equals the eigendecomposition-based sqrt but is
 // branch-free and cheaper:  s = sqrt(det),  t = sqrt(tr + 2s),  sqrt(M) = (M + sI)/t.
 __forceinline__ __device__ Sym2 sqrt_sym2(const Sym2& M)
 {
-	const float eps = 1e-6f;
-	const float det = fmaxf(eps, M.x * M.z - M.y * M.y);
+	const float tr = M.x + M.z;
+	const float det = fmaxf(sym2DetEps(tr), M.x * M.z - M.y * M.y);
 	const float s = sqrtf(det);
-	const float t = sqrtf(fmaxf(eps, (M.x + M.z) + 2.0f * s));
+	const float t = sqrtf(fmaxf(sym2TEps(tr), tr + 2.0f * s));
 	return { (M.x + s) / t, M.y / t, (M.z + s) / t };
 }
 
@@ -80,11 +101,10 @@ __forceinline__ __device__ Sym2 sqrt_sym2_vjp(const Sym2& M, const Sym2& dL_dsqr
 	const float b = M.y;
 	const float c = M.z;
 
-	const float eps = 1e-6f;
-	const float det = fmaxf(eps, a * c - b * b);
-	const float s = sqrtf(det);
 	const float tr = a + c;
-	const float t = sqrtf(fmaxf(eps, tr + 2.0f * s));
+	const float det = fmaxf(sym2DetEps(tr), a * c - b * b);
+	const float s = sqrtf(det);
+	const float t = sqrtf(fmaxf(sym2TEps(tr), tr + 2.0f * s));
 
 	// Forward outputs
 	const float X = (a + s) / t;
