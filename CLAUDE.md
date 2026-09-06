@@ -22,7 +22,7 @@ This is a PyTorch C++/CUDA extension that implements differentiable 3D Gaussian 
    - `GaussianRasterizer` — standard rasterizer; `forward()` returns `(color, radii, depth)`
    - `GaussianRasterizerWithFlow` — differentiable colour + depth + optical-flow rasterizer; `forward()` returns `(color, radii, depth, flow)`; no cache needed. Both colour and flow are differentiable — see [`docs/flow-forward-pass.md`](docs/flow-forward-pass.md) and [`docs/flow-backward-design.md`](docs/flow-backward-design.md)
 
-2. **PyBind11 bindings** (`ext.cpp`) — exposes the CUDA functions to Python as `_C`
+2. **Custom-operator registration** (`ext.cpp`) — declares the schemas with `TORCH_LIBRARY` and binds the CUDA implementations with `TORCH_LIBRARY_IMPL`, so the entry points are reached as `torch.ops.diff_gaussian_rasterization.<name>`. The `_C` extension module only exists so that importing it loads the shared object and triggers registration; `__init__.py` keeps the old `_C.<name>` attributes as aliases for back-compat
 
 3. **CUDA/PyTorch bridge** (`rasterize_points.cu` / `rasterize_points.h`) — allocates PyTorch tensors and calls into the rasterizer; defines `RasterizeGaussiansCUDA`, `RasterizeGaussiansBackwardCUDA`, `RasterizeGaussiansWithFlowCUDA`, `RasterizeGaussiansWithFlowBackwardCUDA`, `markVisible`
 
@@ -48,7 +48,7 @@ Depth uses **median depth** by default: the depth of the Gaussian center whose c
 GaussianRasterizer.forward()
   → rasterize_gaussians()        # Python
   → _RasterizeGaussians.apply()  # torch.autograd.Function
-  → _C.rasterize_gaussians()     # C++ binding
+  → torch.ops.diff_gaussian_rasterization.rasterize_gaussians()  # custom op
   → RasterizeGaussiansCUDA()     # rasterize_points.cu
   → CudaRasterizer::Rasterizer::forward()  # rasterizer_impl.cu
   → [preprocess kernel] + [render kernel]  # forward.cu

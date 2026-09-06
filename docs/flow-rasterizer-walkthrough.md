@@ -53,7 +53,7 @@ from the current frame only.
 GaussianRasterizerWithFlow.forward()                 # __init__.py:370  (nn.Module)
 └ rasterize_gaussians_with_flow()                    # __init__.py:202  (thin wrapper)
   └ _RasterizeGaussiansWithFlow.apply()              # __init__.py:234  (autograd.Function)
-    ├ forward:  _C.rasterize_gaussians_with_flow     # ext.cpp binding
+    ├ forward:  torch.ops.diff_gaussian_rasterization.rasterize_gaussians_with_flow  # ext.cpp
     │  └ RasterizeGaussiansWithFlowCUDA()            # rasterize_points.cu:237  (tensor bridge)
     │     └ CudaRasterizer::DiffFlowRasterizer::forward()  # rasterizer_impl.cu:545
     │        ├ FORWARD::FLOW::preprocess  → preprocessFlowCUDA   # forward.cu:689 / 550
@@ -70,7 +70,7 @@ GaussianRasterizerWithFlow.forward()                 # __init__.py:370  (nn.Modu
              └ BACKWARD::preprocess (current-frame grads, reused from colour) # backward.cu
 ```
 
-Files: `diff_gaussian_rasterization/__init__.py` (Python API), `ext.cpp` (pybind),
+Files: `diff_gaussian_rasterization/__init__.py` (Python API), `ext.cpp` (custom-op registration),
 `rasterize_points.{cu,h}` (torch↔CUDA bridge), `cuda_rasterizer/{rasterizer.h,
 rasterizer_impl.{cu,h}, forward.{cu,h}, backward.{cu,h}, auxiliary.h, config.h}`.
 

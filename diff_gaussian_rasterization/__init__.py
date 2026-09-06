@@ -12,7 +12,24 @@
 from typing import NamedTuple
 import torch.nn as nn
 import torch
-from . import _C
+from . import _C  # noqa: F401  -- loading the extension registers the custom ops
+
+# The CUDA entry points are registered as PyTorch custom operators (see
+# ext.cpp), so they are called through the operator namespace rather than
+# through pybind11 bindings on `_C`.
+_ops = torch.ops.diff_gaussian_rasterization
+
+# Back-compat: `_C.<name>(...)` used to be the pybind11 binding. Keep those
+# attribute names working for callers outside this package.
+for _name in (
+    "rasterize_gaussians",
+    "rasterize_gaussians_backward",
+    "rasterize_gaussians_with_flow",
+    "rasterize_gaussians_with_flow_backward",
+    "mark_visible",
+):
+    setattr(_C, _name, getattr(_ops, _name))
+del _name
 
 def rasterize_gaussians(
     means3D,
@@ -76,8 +93,8 @@ class _RasterizeGaussians(torch.autograd.Function):
         )
 
         # Invoke C++/CUDA rasterizer
-        # num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
-        num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer, depth = _C.rasterize_gaussians(*args)
+        # num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer = _ops.rasterize_gaussians(*args)
+        num_rendered, color, radii, geomBuffer, binningBuffer, imgBuffer, depth = _ops.rasterize_gaussians(*args)
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
@@ -117,7 +134,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raster_settings.device_id)
 
         # Compute gradients for relevant tensors by invoking backward method
-        grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _C.rasterize_gaussians_backward(*args)        
+        grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D, grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations = _ops.rasterize_gaussians_backward(*args)        
 
         grads = (
             grad_means3D,
@@ -156,7 +173,7 @@ class GaussianRasterizer(nn.Module):
         # Mark visible points (based on frustum culling for camera) with a boolean 
         with torch.no_grad():
             raster_settings = self.raster_settings
-            visible = _C.mark_visible(
+            visible = _ops.mark_visible(
                 positions,
                 raster_settings.viewmatrix,
                 raster_settings.projmatrix,
@@ -277,7 +294,7 @@ class _RasterizeGaussiansWithFlow(torch.autograd.Function):
 
         # Returns: num_rendered, color, radii, geomBuf, flowBuf, binBuf, imgBuf, depth, flow
         num_rendered, color, radii, geomBuffer, flowBuffer, binningBuffer, imgBuffer, depth, flow = \
-            _C.rasterize_gaussians_with_flow(*args)
+            _ops.rasterize_gaussians_with_flow(*args)
 
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
@@ -332,7 +349,7 @@ class _RasterizeGaussiansWithFlow(torch.autograd.Function):
         (grad_means2D, grad_colors_precomp, grad_opacities, grad_means3D,
          grad_cov3Ds_precomp, grad_sh, grad_scales, grad_rotations,
          grad_prev_means3D, grad_prev_cov3Ds_precomp, grad_prev_scales,
-         grad_prev_rotations) = _C.rasterize_gaussians_with_flow_backward(*args)
+         grad_prev_rotations) = _ops.rasterize_gaussians_with_flow_backward(*args)
 
         grads = (
             grad_means3D,            # means3D
@@ -360,7 +377,7 @@ class GaussianRasterizerWithFlow(nn.Module):
     def markVisible(self, positions):
         with torch.no_grad():
             raster_settings = self.raster_settings
-            visible = _C.mark_visible(
+            visible = _ops.mark_visible(
                 positions,
                 raster_settings.viewmatrix,
                 raster_settings.projmatrix,

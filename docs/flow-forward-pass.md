@@ -99,7 +99,7 @@ color, radii, depth, flow = rasterize_gaussians_with_flow(
 GaussianRasterizerWithFlow.forward()
   → rasterize_gaussians_with_flow()          # Python
   → _RasterizeGaussiansWithFlow.apply()      # torch.autograd.Function
-  → _C.rasterize_gaussians_with_flow()       # C++ binding (ext.cpp)
+  → torch.ops.diff_gaussian_rasterization.rasterize_gaussians_with_flow()  # custom op (ext.cpp)
   → RasterizeGaussiansWithFlowCUDA()         # rasterize_points.cu
   → CudaRasterizer::DiffFlowRasterizer::forward()  # rasterizer_impl.cu
   → FORWARD::FLOW::preprocess kernel         # forward.cu  (reused)

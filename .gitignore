@@ -4,3 +4,4 @@ dist/
 .idea/
 .codegraph/
 __pycache__/
+*.so

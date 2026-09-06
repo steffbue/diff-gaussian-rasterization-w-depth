@@ -10,12 +10,12 @@
  */
 
 #pragma once
-#include <torch/extension.h>
+#include <torch/types.h>
 #include <cstdio>
 #include <tuple>
 #include <string>
 	
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int64_t, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -23,19 +23,19 @@ RasterizeGaussiansCUDA(
     const torch::Tensor& opacity,
 	const torch::Tensor& scales,
 	const torch::Tensor& rotations,
-	const float scale_modifier,
+	const double scale_modifier,
 	const torch::Tensor& cov3D_precomp,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
-	const float tan_fovx, 
-	const float tan_fovy,
-    const int image_height,
-    const int image_width,
+	const double tan_fovx, 
+	const double tan_fovy,
+    const int64_t image_height,
+    const int64_t image_width,
 	const torch::Tensor& sh,
-	const int degree,
+	const int64_t degree,
 	const torch::Tensor& campos,
 	const bool prefiltered,
-	const int device_id);
+	const int64_t device_id);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
@@ -45,30 +45,30 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const torch::Tensor& colors,
 	const torch::Tensor& scales,
 	const torch::Tensor& rotations,
-	const float scale_modifier,
+	const double scale_modifier,
 	const torch::Tensor& cov3D_precomp,
 	const torch::Tensor& viewmatrix,
     const torch::Tensor& projmatrix,
-	const float tan_fovx, 
-	const float tan_fovy,
+	const double tan_fovx, 
+	const double tan_fovy,
     const torch::Tensor& dL_dout_color,
 	const torch::Tensor& sh,
-	const int degree,
+	const int64_t degree,
 	const torch::Tensor& campos,
 	const torch::Tensor& geomBuffer,
-	const int R,
+	const int64_t R,
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,
-	const int device_id);
+	const int64_t device_id);
 		
 torch::Tensor markVisible(
-		torch::Tensor& means3D,
-		torch::Tensor& viewmatrix,
-		torch::Tensor& projmatrix,
-		const int device_id);
+		const torch::Tensor& means3D,
+		const torch::Tensor& viewmatrix,
+		const torch::Tensor& projmatrix,
+		const int64_t device_id);
 
 // Differentiable version: same weights for colour and flow, no cache needed.
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int64_t, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansWithFlowCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -79,20 +79,20 @@ RasterizeGaussiansWithFlowCUDA(
 	const torch::Tensor& prev_scales,
 	const torch::Tensor& rotations,
 	const torch::Tensor& prev_rotations,
-	const float scale_modifier,
+	const double scale_modifier,
 	const torch::Tensor& cov3D_precomp,
 	const torch::Tensor& prev_cov3D_precomp,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
-	const float tan_fovx,
-	const float tan_fovy,
-    const int image_height,
-    const int image_width,
+	const double tan_fovx,
+	const double tan_fovy,
+    const int64_t image_height,
+    const int64_t image_width,
 	const torch::Tensor& sh,
-	const int degree,
+	const int64_t degree,
 	const torch::Tensor& campos,
 	const bool prefiltered,
-	const int device_id);
+	const int64_t device_id);
 
 // Backward of the differentiable flow rasterizer. Returns current-frame
 // gradients plus previous-frame (flow-specific) gradients.
@@ -107,21 +107,21 @@ RasterizeGaussiansWithFlowBackwardCUDA(
 	const torch::Tensor& prev_scales,
 	const torch::Tensor& rotations,
 	const torch::Tensor& prev_rotations,
-	const float scale_modifier,
+	const double scale_modifier,
 	const torch::Tensor& cov3D_precomp,
 	const torch::Tensor& prev_cov3D_precomp,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
-	const float tan_fovx,
-	const float tan_fovy,
+	const double tan_fovx,
+	const double tan_fovy,
 	const torch::Tensor& dL_dout_color,
 	const torch::Tensor& dL_dout_flow,
 	const torch::Tensor& sh,
-	const int degree,
+	const int64_t degree,
 	const torch::Tensor& campos,
 	const torch::Tensor& geomBuffer,
 	const torch::Tensor& flowBuffer,
-	const int R,
+	const int64_t R,
 	const torch::Tensor& binningBuffer,
 	const torch::Tensor& imageBuffer,
-	const int device_id);
+	const int64_t device_id);
